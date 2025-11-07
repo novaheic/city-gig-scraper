@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Virtual environments (do not commit venvs)
+.venv/
+.venv-ui
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Editors/OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Env files / secrets
+.env
+*.env
+
+# Optional: generated data and outputs
+output/
+data/
+*.csv
+*.parquet
+
+# Node (if any frontend deps)
+node_modules/
+
+
