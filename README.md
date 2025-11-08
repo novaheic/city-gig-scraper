@@ -1,187 +1,173 @@
-# Berlin Mitte Hospitality Job Scraper (MVP)
+# City Gig Scraper
 
-Prototype for discovering hospitality venues in Berlin‑Mitte via the
-Overpass API, fetching their websites politely, and flagging hiring cues.
+Discover hospitality venues from OpenStreetMap and scan their websites for hiring pages/signals. Export results to CSV. Use it via a friendly Web UI or the original CLI.
 
-## Setup
+- Built on Overpass (OSM) discovery + polite, async crawling
+- Detects job/career pages and common hiring keywords
+- CSV export, with preview and download in the UI
 
-Create and activate a virtual environment, then install dependencies:
+Originally created for Berlin‑Mitte; now works for any city as long as OSM has coverage.
 
-```
+## Quick start
+
+### 1) Install
+
+```powershell
 python -m venv .venv
 \.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-## Usage
+### 2) Run the Web UI
 
-After installing dependencies, run the CLI. Replace the user agent with a
-value that includes your contact information.
-
+```powershell
+uvicorn web.app:app --host 127.0.0.1 --port 8000 --reload
 ```
-python -m job_scraper.main ^
-  --area "Bezirk Mitte, Berlin" ^
-  --output "output/berlin_mitte_jobs.csv" ^
-  --user-agent "BerlinJobScraper/0.1 (+https://example.com/contact)" ^
-  --concurrency 15 ^
+
+Open http://127.0.0.1:8000 and:
+- Enter a city (autocomplete helps; e.g., Berlin, Tokyo, New York)
+- Pick categories (amenities) to search (e.g., Cafes, Restaurants, Bars)
+- Click “Run scrape”
+- Watch live progress; when done, preview the first 50 rows and download the CSV
+
+Notes about the UI:
+- Jobs run in the background; you can cancel while running.
+- Downloads are generated in a temporary folder and are kept for ~1 hour.
+- A usage counter is stored at `output/stats.json` (override with the `STATS_FILE` env var).
+
+Set a custom stats path (optional):
+
+```powershell
+$env:STATS_FILE="output\stats.json"
+```
+
+### 3) Or run the CLI
+
+Recommended for bulk runs or automation. Replace the user‑agent with your own contact info.
+
+```powershell
+python -m job_scraper.main `
+  --area "Bezirk Mitte, Berlin" `
+  --output "output/berlin_mitte_jobs.csv" `
+  --user-agent "YourNameJobScraper/0.1 (+https://your.site/contact)" `
+  --concurrency 15 `
   --max-job-links 10
 ```
 
-### Flags
+## Features
 
-- **--area**: Administrative area name to search in OpenStreetMap. The tool tries to
-  resolve the exact OSM relation by name and queries that area. If it cannot resolve
-  the name, it falls back to a fixed Berlin‑Mitte bounding box. For best results, use
-  exact OSM names (e.g., Berlin districts start with "Bezirk ..., Berlin").
-  - Examples: "Bezirk Mitte, Berlin" (default), "Bezirk Friedrichshain-Kreuzberg, Berlin",
-    "Bezirk Neukölln, Berlin", "Bezirk Pankow, Berlin".
+- OSM‑powered discovery by amenity types (cafe, restaurant, bar, pub, bakery, fast_food, etc.)
+- Adaptive querying: tries single‑area; falls back to grid tiling on errors/timeouts
+- Optional district splitting for large cities to avoid Overpass timeouts
+- Asynchronous, polite crawling (httpx, configurable concurrency)
+- Heuristic detection of job pages and hiring cues; vendor platform recognition
+- CSV output ready for Google Sheets
+- Minimal Web UI (FastAPI) with city autocomplete, amenity pills, live progress, preview, and download
 
-- **--amenities**: Comma‑separated list of amenity types to include (OSM `amenity=*`).
-  Defaults: `cafe,restaurant,bar,pub,fast_food,bakery,ice_cream,biergarten,food_court`.
-  - Example (cafes only): `--amenities cafe`
-  - Example (add nightclub): `--amenities cafe,restaurant,bar,nightclub`
+## Web UI details
 
-- **--output**: Path to the CSV that will be written with discovered venues and hiring signals.
-  - Example: `--output output/fhain_jobs.csv`
+- Start locally: `uvicorn web.app:app --host 127.0.0.1 --port 8000 --reload`
+- Home (`/`): submit Location and Categories, then “Run scrape”
+- Status polling and cancellation are built‑in
+- Preview (first 50 rows) is shown when done
+- Download via a button (served from a temporary file)
+- Usage counter endpoint (`/stats`) writes to `output/stats.json` (override with `STATS_FILE`)
+- Temporary CSVs live under your system temp in a `city_gig_scraper_outputs` folder and are auto‑cleaned after ~1 hour
 
-- **--user-agent**: User‑Agent string sent with HTTP requests. Include contact info
-  (URL or email) so website owners can reach you.
-  - Example: `--user-agent "YourNameJobScraper/0.1 (+https://your.site/contact)"`
+## CLI usage and flags
 
-- **--concurrency**: Max concurrent HTTP requests. Higher is faster but be polite.
-  Typical range: 5–15.
+Basic run:
 
-- **--max-job-links**: Max number of candidate "jobs/careers" links to follow per site.
-  Lower this to speed up; raise to be more thorough.
-
-- **--crawl-depth**: How deep to follow internal links when searching for job pages (>= 1).
-
-- **--limit**: Limit the number of places processed/tried (useful for quick tests).
-  - Example: `--limit 25`
-
-- **--overpass-url**: Optional Overpass API endpoint override.
-
-- **--log-level**: Logging verbosity (e.g., `INFO`, `DEBUG`).
-
-- **--split-into-districts**: Automatically split large areas (e.g., "Berlin") into
-  districts and query each separately to avoid timeouts. See "Scanning entire cities"
-  section below for details.
-
-### Changing the area (examples)
-
-Use exact OSM administrative names for reliable results.
-
-```
-# Location
-python -m job_scraper.main --area "Bezirk Friedrichshain-Kreuzberg, Berlin" --output output/fhain_xberg_jobs.csv
-python -m job_scraper.main --area "Bezirk Neukölln, Berlin" --output output/neukolln_jobs.csv
-python -m job_scraper.main --area "Hamburg" --output output/hamburg_jobs.csv
-python -m job_scraper.main --area "München" --output output/muenchen_jobs.csv
-...
+```powershell
+python -m job_scraper.main `
+  --area "Bezirk Mitte, Berlin" `
+  --output "output/berlin_mitte_jobs.csv" `
+  --user-agent "YourNameJobScraper/0.1 (+https://your.site/contact)"
 ```
 
-Note:
-- Do not use ambiguous names like "Frankfurt" alone. Prefer the exact OSM name,
-  e.g., "Frankfurt am Main" or "Frankfurt (Oder)".
+Common flags:
+- **--area**: Administrative area name in OSM. Use exact names where possible.
+- **--amenities**: Comma‑separated OSM amenity types.
+  - Default: `cafe,restaurant,bar,pub,fast_food,bakery,ice_cream,biergarten,food_court`
+- **--output**: CSV path to write results.
+- **--user-agent**: Include your contact info (URL or email) in the header.
+- **--concurrency**: Max concurrent HTTP requests (try 5–18; be polite).
+- **--max-job-links**: Max candidate job links to follow per site.
+- **--crawl-depth**: Max internal link depth (>= 1).
+- **--limit**: Limit number of places (useful for quick tests).
+- **--overpass-url**: Override Overpass endpoint if needed.
+- **--log-level**: `INFO` (default) or `DEBUG` for more detail.
+- **--split-into-districts**: Automatically split large areas into districts to reduce Overpass timeouts.
 
-Tips:
-- If an area name cannot be resolved in OSM, the scraper will fall back to a
-  fixed Berlin‑Mitte bounding box (even if you requested another city). Double‑check
-  the spelling/casing and prefer the full administrative name.
-- For quick trials, combine a smaller area with `--limit` (e.g., `--limit 20`).
-- **Large areas may timeout**: Querying entire cities (e.g., "Berlin" alone) with many
-  amenities can cause Overpass API timeouts (504 errors). Use the `--split-into-districts`
-  flag to automatically break large areas into smaller districts and query each separately.
-
-### Scanning entire cities
-
-To scan an entire city without timeouts, use the `--split-into-districts` flag. This
-automatically discovers sub-areas (districts) of the parent area and queries each
-separately, then combines the results.
-
-**Example - scanning all of Berlin:**
+Scan an entire city with district splitting (recommended for large metros):
 
 ```powershell
 python -m job_scraper.main `
   --area "Berlin" `
   --split-into-districts `
   --output "output/berlin_all_jobs.csv" `
-  --user-agent "BerlinJobScraper/0.1 (+mailto:your@email.com)" `
+  --user-agent "YourNameJobScraper/0.1 (+mailto:you@example.com)" `
   --concurrency 18 `
   --max-job-links 10
 ```
 
-**How it works:**
-1. The scraper queries OSM to find all districts within the parent area (e.g., all
-   Berlin Bezirke when querying "Berlin").
-2. Each district is queried separately to avoid timeouts.
-3. Results are combined and deduplicated by website URL.
-4. The combined results are then scraped for hiring signals.
+Change the amenity mix:
 
-**Note:** If sub-areas cannot be found automatically, the scraper falls back to
-querying the area as a single unit. This feature works best for cities with
-well-defined administrative districts in OSM.
-
-### Changing the amenities (examples)
-
-The `--amenities` flag accepts a comma-separated list of OpenStreetMap amenity types.
-These determine which types of venues are discovered and scraped.
-
-**Common hospitality/food service amenities:**
-- `cafe` - Coffee shops and cafes
-- `restaurant` - Full-service restaurants
-- `bar` - Bars and cocktail lounges
-- `pub` - Pubs and taverns
-- `fast_food` - Fast food restaurants
-- `bakery` - Bakeries
-- `ice_cream` - Ice cream shops
-- `biergarten` - Beer gardens
-- `food_court` - Food courts
-- `nightclub` - Nightclubs
-- `canteen` - Cafeterias and canteens
-
-**Other useful amenity types:**
-- `hotel` - Hotels
-- `hostel` - Hostels
-- `cinema` - Movie theaters
-- `theatre` - Theaters
-- `library` - Libraries
-- `pharmacy` - Pharmacies
-- `hospital` - Hospitals
-- `bank` - Banks
-- `fuel` - Gas stations
-- `parking` - Parking facilities
-
-**Examples:**
-
-```
+```powershell
 # Only cafes
 python -m job_scraper.main --area "Berlin" --amenities cafe --output output/cafes_only.csv
 
 # Restaurants and bars only
 python -m job_scraper.main --area "Berlin" --amenities restaurant,bar --output output/restaurants_bars.csv
 
-# Add nightclubs to default set
+# Add nightclubs to defaults
 python -m job_scraper.main --area "Berlin" --amenities cafe,restaurant,bar,pub,fast_food,bakery,ice_cream,biergarten,food_court,nightclub
-
-# Hotels and hostels
-python -m job_scraper.main --area "Berlin" --amenities hotel,hostel --output output/accommodation.csv
-
-# Mix of hospitality and entertainment
-python -m job_scraper.main --area "Berlin" --amenities restaurant,bar,cinema,theatre --output output/entertainment.csv
 ```
 
-**Tips:**
-- Use exact OSM amenity tag names (lowercase with underscores). Check the
-  [OpenStreetMap Wiki](https://wiki.openstreetmap.org/wiki/Key:amenity) for the
-  complete list of valid amenity types.
-- The default amenities are defined in `job_scraper/main.py` as `DEFAULT_AMENITIES`.
-  You can modify that constant to change the default for all runs.
-- Combine with `--limit` to test different amenity combinations quickly.
+Tips for areas:
+- Use exact OSM names. Prefer “Frankfurt am Main” over “Frankfurt”.
+- If resolution fails, the tool may fall back to a Berlin‑Mitte bounding box. Double‑check spelling/casing.
+- For quick trials, combine a smaller area with `--limit` (e.g., `--limit 20`).
 
-**Google Sheets Import**
+## Output
 
-Just copy the csv's content, click on cell A1 in a new google sheet > cmd+shift+v > Data (with A column still highlighted) > Split Text to Columns
+The CSV schema:
+- `name`: Venue name
+- `type`: OSM amenity type
+- `homepage`: Discovered website
+- `job_page_url`: Detected job/career page (if found)
 
+CLI outputs are written to your chosen `--output` path (commonly under `output/`).
+UI outputs are temporary and downloadable via the browser.
+
+Google Sheets import:
+1) Copy the CSV contents
+2) Paste into cell A1 in a new Google Sheet (Cmd/Ctrl+Shift+V for plain text)
+3) Data → Split text to columns
+
+## Politeness and stability
+
+- Keep concurrency reasonable; be respectful of target sites.
+- Include a real user agent with contact info when using the CLI.
+- Overpass can rate‑limit or time out on large queries; use district splitting for big cities.
+
+## Development
+
+Project layout:
+- `job_scraper/` — CLI entrypoint and core logic (discovery, crawling, detection)
+- `web/app.py` — FastAPI app for the Web UI
+- `output/` — Default location for CLI outputs and the UI’s `stats.json`
+
+Run the web app in dev:
+
+```powershell
+uvicorn web.app:app --reload
+```
+
+Run the CLI locally:
+
+```powershell
+python -m job_scraper.main --area "Bezirk Mitte, Berlin" --output output/test.csv --user-agent "DevTest/0.1 (+mailto:you@example.com)"
+```
 
