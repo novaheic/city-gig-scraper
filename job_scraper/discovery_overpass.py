@@ -26,18 +26,23 @@ def _resolve_area_relation_id(
     overpass_url: str = OVERPASS_URL,
     client: httpx.Client | None = None,
 ) -> int | None:
-    """Resolve an area name to an OSM relation ID."""
+    """Resolve an area name to an OSM relation ID.
+
+    If multiple relations share the same name (e.g., Stuttgart, US vs DE),
+    prefer likely administrative city relations and bias away from US entries
+    unless clearly requested.
+    """
     owns_client = client is None
     if owns_client:
         client = httpx.Client(timeout=httpx.Timeout(60.0, connect=10.0, read=30.0))
 
     assert client is not None
 
-    # Query for relations matching the area name
+    # Query for relations matching the area name and include tags for ranking
     query = f"""
 [out:json][timeout:25];
-relation["name"="{area_name}"]["type"~"^(boundary|administrative)$"];
-out ids;
+relation["name"="{area_name}"]["type"~"^(boundary|administrative)$"]["admin_level"];
+out ids tags;
 """
 
     try:
@@ -46,8 +51,51 @@ out ids;
         payload = response.json()
         elements = payload.get("elements", [])
         if elements:
-            # Return the first matching relation ID
-            return elements[0].get("id")
+            # Rank candidates: prefer EU/Germany cities over US homonyms, favor city-level admin_levels
+            def rank(elem: dict) -> int:
+                tags = elem.get("tags", {}) or {}
+                score = 0
+                admin_level = str(tags.get("admin_level", "")).strip()
+                name_de = tags.get("name:de")
+                is_in = " ".join(
+                    [
+                        str(tags.get(k, ""))
+                        for k in (
+                            "is_in",
+                            "is_in:country",
+                            "addr:country",
+                            "country",
+                            "ISO3166-1",
+                        )
+                    ]
+                ).lower()
+
+                # Prefer city-ish admin levels
+                if admin_level in {"6", "7", "8"}:
+                    score += 5
+                elif admin_level in {"4", "5"}:
+                    score += 2
+
+                # Country bias: prefer Germany/EU, down-rank US
+                if any(token in is_in for token in ("germany", "de", "deu")):
+                    score += 10
+                if any(token in is_in for token in ("europe", "eu")):
+                    score += 3
+                if any(token in is_in for token in ("united states", "usa", "us")):
+                    score -= 10
+
+                # Language hint
+                if name_de:
+                    score += 3
+
+                # Slight preference for shorter names (avoid regions like "Regierungsbezirk ...")
+                name_len = len((tags.get("name") or "").strip())
+                score += max(0, 20 - min(20, name_len))
+
+                return score
+
+            best = max(elements, key=rank)
+            return best.get("id")
     except Exception as exc:
         logger.debug("Failed to resolve area '%s': %s", area_name, exc)
     finally:
@@ -366,7 +414,12 @@ def fetch_places(
         if area_relation_id:
             logger.info("Resolved area '%s' to relation ID %d", area, area_relation_id)
         else:
-            logger.info("Could not resolve area '%s' to relation ID, using bounding box fallback", area)
+            # Do NOT silently fall back to Berlin-Mitte; surface an error instead
+            logger.warning("Could not resolve area '%s' to relation ID", area)
+            raise OverpassError(
+                f"Unable to resolve area '{area}'. Please use an exact OSM administrative name "
+                "(e.g., 'Frankfurt am Main', 'Frankfurt (Oder)', 'Berlin')."
+            )
 
     query = build_query(area, amenities, area_relation_id=area_relation_id)
 

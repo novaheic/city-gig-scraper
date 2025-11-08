@@ -7,11 +7,15 @@ from pathlib import Path
 import asyncio
 import csv
 import json
+import logging
+import os
+import tempfile
+import time
 import json
 from typing import Optional
 
 from fastapi import BackgroundTasks, FastAPI, Form
-from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, RedirectResponse, JSONResponse
 
 from job_scraper.main import DEFAULT_AREA, main as cli_main
 from job_scraper.main import _process_place as _main_process_place  # type: ignore
@@ -24,14 +28,103 @@ from job_scraper.discovery_overpass import (
     fetch_places_by_grid,
 )
 
-app = FastAPI(title="Part-Time Service Job Scraper UI")
+# Restore request-level logging (including httpx request lines) in the app process.
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+logging.getLogger("httpx").setLevel(logging.INFO)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+# Ephemeral output storage (temp directory) with automatic cleanup
+OUTPUT_DIR = Path(tempfile.gettempdir()) / "city_gig_scraper_outputs"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+JOB_TTL_SECONDS = 60 * 60  # 1 hour
+CLEANUP_INTERVAL_SECONDS = 10 * 60  # 10 minutes
+
+_cleanup_task: asyncio.Task | None = None
+
+# Simple file-backed stats (no database)
+# Use a persistent path in the repo's output folder by default; allow override via env var.
+_BASE_DIR = Path(__file__).resolve().parents[1]
+STATS_DIR = _BASE_DIR / "output"
+STATS_DIR.mkdir(parents=True, exist_ok=True)
+_ENV_STATS_FILE = os.getenv("STATS_FILE")
+COUNTER_FILE = Path(_ENV_STATS_FILE) if _ENV_STATS_FILE else (STATS_DIR / "stats.json")
+
+def _load_stats() -> dict[str, int]:
+    try:
+        if COUNTER_FILE.exists():
+            with COUNTER_FILE.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict) and "jobs_started" in data:
+                    try:
+                        return {"jobs_started": int(data.get("jobs_started", 0))}
+                    except Exception:
+                        return {"jobs_started": 0}
+    except Exception:
+        pass
+    return {"jobs_started": 0}
+
+def _save_stats(stats: dict[str, int]) -> None:
+    try:
+        with COUNTER_FILE.open("w", encoding="utf-8") as f:
+            json.dump({"jobs_started": int(stats.get("jobs_started", 0))}, f)
+    except Exception:
+        # best-effort; ignore errors
+        pass
+
+def _get_jobs_started() -> int:
+    return int(_load_stats().get("jobs_started", 0))
+
+def _increment_jobs_started(amount: int = 1) -> int:
+    stats = _load_stats()
+    stats["jobs_started"] = int(stats.get("jobs_started", 0)) + int(amount)
+    _save_stats(stats)
+    return stats["jobs_started"]
+
+
+async def _cleanup_loop() -> None:
+    while True:
+        try:
+            now = time.time()
+            expired: list[str] = []
+            for job_id, info in list(JOBS.items()):
+                created_at = float(info.get("created_at", 0.0) or 0.0)
+                status = str(info.get("status", ""))
+                # Expire finished/cancelled/error jobs after TTL, and stale running jobs
+                if created_at and (now - created_at) > JOB_TTL_SECONDS:
+                    expired.append(job_id)
+            for job_id in expired:
+                try:
+                    path = Path(str(JOBS.get(job_id, {}).get("output", "")))
+                    if path.exists() and path.is_file():
+                        path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                JOBS.pop(job_id, None)
+        except Exception:
+            # Best-effort cleanup; ignore errors
+            pass
+        await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)
+
+app = FastAPI(title="City Gig Scraper UI")
 
 # Simple in-memory store for job status.
 JOBS: dict[str, dict[str, object]] = {}
 
+@app.on_event("startup")
+async def _on_startup() -> None:
+    global _cleanup_task
+    if _cleanup_task is None:
+        _cleanup_task = asyncio.create_task(_cleanup_loop())
+    # Initialize stats file if missing
+    try:
+        if not COUNTER_FILE.exists():
+            _save_stats({"jobs_started": 0})
+    except Exception:
+        pass
+
 UI_USER_AGENT = "JobScraper/0.1 (+https://github.com/novaheic)"
-UI_CONCURRENCY = 15
-UI_MAX_JOB_LINKS = 10
+UI_CONCURRENCY = 18
+UI_MAX_JOB_LINKS = 6
 UI_CRAWL_DEPTH = 3
 UI_LIMIT: Optional[int] = None
 UI_OVERPASS_URL: Optional[str] = None
@@ -59,7 +152,7 @@ EU_CITIES: list[str] = [
     # France
     "Paris", "Marseille", "Lyon", "Toulouse", "Nice", "Nantes", "Strasbourg", "Montpellier", "Bordeaux", "Lille",
     # Germany
-    "Berlin", "Hamburg", "Munich", "Cologne", "Frankfurt", "Stuttgart", "Düsseldorf", "Dortmund", "Essen", "Leipzig",
+    "Berlin", "Hamburg", "Munich", "Cologne", "Frankfurt am Main", "Frankfurt (Oder)", "Stuttgart", "Düsseldorf", "Dortmund", "Essen", "Leipzig",
     # Greece
     "Athens", "Thessaloniki", "Patras", "Heraklion", "Larissa", "Volos", "Ioannina", "Chania", "Chalkida", "Kalamata",
     # Hungary
@@ -138,17 +231,10 @@ AMENITY_OPTIONS: list[tuple[str, str, str]] = [
     ("biergarten", "🍻", "Beer Gardens"),
     ("food_court", "🥡", "Food Courts"),
     ("nightclub", "🕺", "Nightclubs"),
-    ("canteen", "🍱", "Canteens"),
     ("hotel", "🏨", "Hotels"),
     ("hostel", "🛏️", "Hostels"),
     ("cinema", "🎬", "Cinemas"),
     ("theatre", "🎭", "Theatres"),
-    ("library", "📚", "Libraries"),
-    ("pharmacy", "💊", "Pharmacies"),
-    ("hospital", "🏥", "Hospitals"),
-    ("bank", "🏦", "Banks"),
-    ("fuel", "⛽", "Fuel Stations"),
-    ("parking", "🅿️", "Parking"),
 ]
 
 DEFAULT_AMENITY_SELECTION = ["cafe", "restaurant", "bar", "pub", "bakery"]
@@ -309,13 +395,17 @@ def index() -> str:
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Part-Time Service Job Scraper</title>
+    <title>City Gig Scraper</title>
     <style>
       body {{
         font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
         margin: 2rem auto;
         max-width: 880px;
         line-height: 1.5;
+        display: flex;
+        flex-direction: column;
+        min-height: 100vh;
+        padding-bottom: 3.25rem; /* keep content visible above fixed footer */
       }}
       label {{
         display: block;
@@ -361,6 +451,20 @@ def index() -> str:
       .hint {{
         color: #4b5563;
         font-size: 0.9rem;
+      }}
+      .error-text {{
+        color: #dc2626;
+        font-size: 0.85rem;
+        margin-top: 0.35rem;
+      }}
+      .has-error input {{
+        border-color: #dc2626;
+      }}
+      .amenities-section.has-error {{
+        outline: 2px solid #dc2626;
+        outline-offset: 4px;
+        border-radius: 8px;
+        padding: 0.35rem;
       }}
       .area-autocomplete {{
         position: relative;
@@ -429,11 +533,12 @@ def index() -> str:
         align-items: center;
         gap: 0.5rem;
         font-weight: 600;
-        color: #111827;
+        color: #58606b; /* softer 80%-ish gray for unselected */
         transition: all 0.15s ease-in-out;
       }}
       .amenity-pill:hover {{
         border-color: #94a3b8;
+        color: #0c0d0d;
         background: #e2e8f0;
       }}
       .amenity-pill.selected {{
@@ -442,20 +547,20 @@ def index() -> str:
         border-color: #2563eb;
       }}
       .amenity-actions {{
-        margin-top: 0.75rem;
+        margin-top: 0.5rem;
       }}
       .amenity-actions button {{
-        border-radius: 6px;
-        border: 1px solid #2563eb;
-        background: #2563eb;
-        color: #ffffff;
-        padding: 0.45rem 0.9rem;
+        border: none;
+        background: transparent;
+        color: #6b7280; /* gray-500 */
+        padding: 0.1rem 0;
         cursor: pointer;
         font-weight: 600;
+        text-decoration: none;
       }}
       .amenity-actions button:hover {{
-        background: #1d4ed8;
-        border-color: #1d4ed8;
+        text-decoration: underline;
+        color: #374151; /* gray-700 */
       }}
       a {{
         color: #2563eb;
@@ -467,15 +572,14 @@ def index() -> str:
     </style>
   </head>
   <body>
-    <h1>Part-Time Service Job Scraper</h1>
+    <h1>City Gig Scraper</h1>
     <p class="hint">
       Are you looking for a job as a barista, hostess, bartender, waiter, cook, or in any other service role?
-      This tool searches cafes, restaurants, bars, and related venues for hiring pages that often never make it to
-      social media. Originally built for Berlin, but should work worldwide.
+      This tool searches cafes, restaurants, bars, and related venues for hiring pages. Originally built for Berlin, but should work worldwide.
     </p>
     <form method="post" action="/run">
-      <label>Area</label>
-      <div class="area-autocomplete">
+      <label>Location</label>
+      <div class="area-autocomplete" id="area-field">
         <input
           type="text"
           id="area-input"
@@ -486,8 +590,8 @@ def index() -> str:
         />
         <div class="area-suggestions" id="area-suggestions" hidden></div>
       </div>
+      <div id="area-error" class="error-text" style="display:none;"></div>
       <div class="amenities-section">
-        <span class="hint">Toggle venue types by clicking the pills or select them all.</span>
         <input type="hidden" name="amenities" id="amenities-input" value="{DEFAULT_AMENITY_STRING}" />
         <div class="amenity-pills">
           {pill_markup}
@@ -496,6 +600,7 @@ def index() -> str:
           <button type="button" id="select-all-amenities" data-mode="select">Select all amenities</button>
         </div>
       </div>
+      <div id="amenities-error" class="error-text" style="display:none;"></div>
       <!-- splitting is adaptive; no UI control -->
 
       <div class="run-controls">
@@ -613,8 +718,25 @@ def index() -> str:
       const previewContainer = document.getElementById("preview-container");
       const previewTable = document.getElementById("preview-table");
       const downloadLink = document.getElementById("download-link");
+      const areaField = document.getElementById("area-field");
+      const areaError = document.getElementById("area-error");
+      const amenitiesError = document.getElementById("amenities-error");
+      const jobsStartedEl = document.getElementById("jobs-started");
       let currentJobId = null;
       let pollTimer = null;
+
+      async function refreshJobsStarted() {{
+        try {{
+          const el = document.getElementById("jobs-started");
+          const res = await fetch("/stats");
+          const data = await res.json();
+          if (el && data && typeof data.jobs_started === "number") {{
+            el.textContent = `Uses: ${{data.jobs_started}}`;
+          }}
+        }} catch (e) {{
+          // ignore
+        }}
+      }}
 
       function updateHiddenAmenities() {{
         const selectedAmenities = amenityPills
@@ -666,6 +788,22 @@ def index() -> str:
         }}
       }}
 
+      function showFieldError(containerEl, errorEl, message) {{
+        if (containerEl) containerEl.classList.add("has-error");
+        if (errorEl) {{
+          errorEl.textContent = message || "";
+          errorEl.style.display = message ? "block" : "none";
+        }}
+      }}
+
+      function clearFieldError(containerEl, errorEl) {{
+        if (containerEl) containerEl.classList.remove("has-error");
+        if (errorEl) {{
+          errorEl.textContent = "";
+          errorEl.style.display = "none";
+        }}
+      }}
+
       function renderPreview(rows) {{
         if (!rows || !rows.length) {{
           previewTable.innerHTML = "<div class='hint' style='padding:0.6rem;'>No rows.</div>";
@@ -695,7 +833,7 @@ def index() -> str:
           const res = await fetch(`/status_json/${{currentJobId}}`);
           const data = await res.json();
           if (data.error === "unknown_job") {{
-            runStatus.textContent = "Unknown job.";
+            runStatus.textContent = "Job Cancelled.";
             setRunState("idle");
             return;
           }}
@@ -705,7 +843,7 @@ def index() -> str:
             const total = data.total ?? 0;
             const processed = data.processed ?? 0;
             const found = data.found ?? 0;
-            runStatus.textContent = `Scanned ${{processed}}/${{total}} places, found ${{found}} hiring pages`;
+            runStatus.textContent = `Scanned ${{processed}}/${{total}} places, found ${{found}} hiring pages - most results appear in the last 1/3 of the scan.`;
           }} else if (data.status === "done") {{
             runStatus.textContent = "Done.";
             setRunState("idle");
@@ -736,8 +874,54 @@ def index() -> str:
         }}
       }}
 
+      // Live validation
+      areaInput.addEventListener("input", () => {{
+        if (areaInput.value.trim()) {{
+          clearFieldError(areaField, areaError);
+        }}
+      }});
+
+      function validateAmenities() {{
+        const val = hiddenAmenities.value.trim();
+        if (!val) {{
+          showFieldError(document.querySelector(".amenities-section"), amenitiesError, "Please select at least one amenity.");
+          return false;
+        }}
+        clearFieldError(document.querySelector(".amenities-section"), amenitiesError);
+        return true;
+      }}
+
+      amenityPills.forEach((pill) => {{
+        pill.addEventListener("click", () => {{
+          validateAmenities();
+        }});
+      }});
+
+      if (selectAllBtn) {{
+        selectAllBtn.addEventListener("click", () => {{
+          validateAmenities();
+        }});
+      }}
+
       formEl.addEventListener("submit", async (e) => {{
         e.preventDefault();
+
+        // Client-side validation
+        let valid = true;
+        if (!areaInput.value.trim()) {{
+          showFieldError(areaField, areaError, "Please enter a city.");
+          areaInput.focus();
+          valid = false;
+        }} else {{
+          clearFieldError(areaField, areaError);
+        }}
+        if (!validateAmenities()) {{
+          valid = false;
+        }}
+        if (!valid) {{
+          return;
+        }}
+
         if (runButton.dataset.state === "running" && currentJobId) {{
           setRunState("cancelling");
           try {{
@@ -754,10 +938,22 @@ def index() -> str:
         try {{
           const formData = new FormData(formEl);
           const res = await fetch("/run", {{ method: "POST", body: formData }});
+          if (!res.ok) {{
+            const data = await res.json().catch(() => ({{}}));
+            if (data && data.error === "validation") {{
+              if (data.area) showFieldError(areaField, areaError, data.area);
+              if (data.amenities) showFieldError(document.querySelector(".amenities-section"), amenitiesError, data.amenities);
+              setRunState("idle");
+              return;
+            }}
+            throw new Error("Start failed");
+          }}
           const data = await res.json();
           currentJobId = data.job_id;
           setRunState("running");
           runStatus.textContent = "Listing places…";
+          // Refresh footer counter after a successful start
+          refreshJobsStarted();
           if (pollTimer) clearInterval(pollTimer);
           pollTimer = setInterval(pollStatus, 800);
         }} catch (err) {{
@@ -765,7 +961,20 @@ def index() -> str:
           setRunState("idle");
         }}
       }});
+      // Initial footer counter
+      window.addEventListener("load", refreshJobsStarted);
     </script>
+    <footer style="position:fixed;left:0;right:0;bottom:0;padding:0.6rem 1rem;border-top:1px solid #e5e7eb;background:#ffffff;color:#6b7280;font-size:0.9rem;">
+      <div style="max-width:880px;margin:0 auto;display:flex;justify-content:space-between;align-items:center;">
+        <div>
+          <span>Source code on </span>
+          <a href="https://github.com/novaheic/city-gig-scraper" target="_blank" rel="noopener" style="color:#2563eb;">
+            GitHub
+          </a>
+        </div>
+        <div id="jobs-started" class="hint">Jobs started: –</div>
+      </div>
+    </footer>
   </body>
 </html>
 """
@@ -777,13 +986,22 @@ def run(
     area: str = Form(DEFAULT_AREA),
     amenities: str = Form(DEFAULT_AMENITY_STRING),
 ):
+    # Server-side validation
+    if not (area and area.strip()):
+        return JSONResponse({"error": "validation", "area": "Please enter a city."}, status_code=400)
+    if not (amenities and amenities.strip()):
+        return JSONResponse({"error": "validation", "amenities": "Please select at least one amenity."}, status_code=400)
+
     job_id = uuid.uuid4().hex[:10]
-    output_path = Path("output") / f"{job_id}.csv"
+    output_path = OUTPUT_DIR / f"{job_id}.csv"
 
     JOBS[job_id] = {
         "status": "running",
         "output": str(output_path),
+        "created_at": time.time(),
     }
+    # Count this as a started job (no DB; file-backed counter)
+    _increment_jobs_started(1)
 
     background.add_task(
         _run_job_sync,
@@ -798,6 +1016,10 @@ def run(
         overpass_url=UI_OVERPASS_URL,
     )
     return {"job_id": job_id}
+
+@app.get("/stats")
+def stats():
+    return {"jobs_started": _get_jobs_started()}
 
 
 @app.get("/status/{job_id}", response_class=HTMLResponse)
@@ -863,6 +1085,15 @@ def cancel(job_id: str):
     if not info:
         return {"ok": False, "error": "unknown_job"}
     info["status"] = "cancelled"
+    # Best-effort delete any output immediately
+    try:
+        path = Path(str(info.get("output", "")))
+        if path.exists() and path.is_file():
+            path.unlink(missing_ok=True)
+    except Exception:
+        pass
+    # Remove job metadata
+    JOBS.pop(job_id, None)
     return {"ok": True}
 
 @app.get("/download/{job_id}")
