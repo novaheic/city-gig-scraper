@@ -748,10 +748,10 @@ def index() -> str:
       function toggleSelectAllButtonLabel() {{
         const hasUnselected = amenityPills.some((pill) => !pill.classList.contains("selected"));
         if (hasUnselected) {{
-          selectAllBtn.textContent = "Select all amenities";
+          selectAllBtn.textContent = "Select all categories";
           selectAllBtn.dataset.mode = "select";
         }} else {{
-          selectAllBtn.textContent = "Deselect all amenities";
+          selectAllBtn.textContent = "Deselect all categories";
           selectAllBtn.dataset.mode = "deselect";
         }}
       }}
@@ -884,7 +884,7 @@ def index() -> str:
       function validateAmenities() {{
         const val = hiddenAmenities.value.trim();
         if (!val) {{
-          showFieldError(document.querySelector(".amenities-section"), amenitiesError, "Please select at least one amenity.");
+          showFieldError(document.querySelector(".amenities-section"), amenitiesError, "Please select at least one category.");
           return false;
         }}
         clearFieldError(document.querySelector(".amenities-section"), amenitiesError);
