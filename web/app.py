@@ -804,6 +804,24 @@ def index() -> str:
         }}
       }}
 
+      function escapeHtml(s) {{ return (s ?? "").toString().replace(/[&<>]/g, m => ({{"&":"&amp;","<":"&lt;",">":"&gt;"}}[m])); }}
+      function normalizeKey(k) {{ return (k || "").toString().trim().toLowerCase(); }}
+      function displayHeader(col) {{
+        const key = normalizeKey(col);
+        if (key === "job_page_url" || key === "hiring_page_url" || key === "hiring_page") {{
+          return "Hiring Page";
+        }}
+        return col;
+      }}
+      function renderCell(col, value) {{
+        const key = normalizeKey(col);
+        const val = (value ?? "").toString().trim();
+        if ((key === "job_page_url" || key === "hiring_page_url" || key === "hiring_page") && val) {{
+          const safeUrl = val.replace(/\\"/g, "&quot;");
+          return `<a href="${{safeUrl}}" target="_blank" rel="noopener noreferrer">${{escapeHtml(val)}}</a>`;
+        }}
+        return escapeHtml(val);
+      }}
       function renderPreview(rows) {{
         if (!rows || !rows.length) {{
           previewTable.innerHTML = "<div class='hint' style='padding:0.6rem;'>No rows.</div>";
@@ -813,13 +831,13 @@ def index() -> str:
         let html = "<table style='width:100%;border-collapse:collapse;font-size:0.95rem;'>";
         html += "<thead><tr>";
         cols.forEach(c => {{
-          html += `<th style="text-align:left;border-bottom:1px solid #e5e7eb;padding:0.5rem;">${{c}}</th>`;
+          html += `<th style="text-align:left;border-bottom:1px solid #e5e7eb;padding:0.5rem;">${{displayHeader(c)}}</th>`;
         }});
         html += "</tr></thead><tbody>";
         rows.forEach(r => {{
           html += "<tr>";
           cols.forEach(c => {{
-            html += `<td style="border-bottom:1px solid #f1f5f9;padding:0.5rem;vertical-align:top;">${{(r[c] ?? "").toString()}}</td>`;
+            html += `<td style="border-bottom:1px solid #f1f5f9;padding:0.5rem;vertical-align:top;">${{renderCell(c, r[c])}}</td>`;
           }});
           html += "</tr>";
         }});
