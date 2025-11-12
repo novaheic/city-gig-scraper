@@ -13,6 +13,8 @@ City Gig Scraper automates this:
 
 Now you have one list to review, filter, and work through systematically.
 
+![Working through results](output.PNG)
+
 ---
 
 ## 🌐 Use the hosted version (easiest)
