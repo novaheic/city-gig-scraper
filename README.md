@@ -76,6 +76,7 @@ python -m job_scraper.main `
 - Temporary CSVs live under your system temp in a `city_gig_scraper_outputs` folder and are auto‑cleaned after ~1 hour
 - Jobs queue automatically when all worker slots are busy. The status indicator shows `Queued… (position/length)` until a slot frees up.
 - `/stats` now supports `HEAD` requests so free uptime monitors can keep the app warm without counting as traffic.
+- Opt-in email notification: enter an address to receive a download link when the CSV is ready (link defaults to 24 h validity)
 
 ### Hosting & tuning
 
@@ -104,6 +105,36 @@ UPSTASH_REDIS_REST_TOKEN=...
 ```
 
 Tip: Pair the app with a lightweight uptime ping (e.g., UptimeRobot `HEAD https://your-app/stats` every 10 minutes) to avoid cold starts on free tiers.
+
+### Email notifications
+
+- The Web UI email field is optional. When supplied, the app emails a link once the CSV finishes.
+- Links stay live for one hour by default; emailed jobs automatically extend the TTL to `RESULTS_TTL_SECONDS` (defaults to 86 400 s / 24 h). Adjust as needed.
+- Configure one mail channel (first match wins):
+  - **Resend** – `RESEND_API_KEY`, `EMAIL_FROM`
+  - **Postmark** – `POSTMARK_TOKEN`, `EMAIL_FROM`
+  - **SMTP** – `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM` (optional `EMAIL_FROM`), `SMTP_TLS` (`true`/`starttls`/`ssl`/`none`), optional `SMTP_TIMEOUT`
+- Example `.env` (Resend):
+
+```dotenv
+EMAIL_FROM=noreply@example.com
+RESEND_API_KEY=re_1234567890abcdef
+RESULTS_TTL_SECONDS=86400
+```
+
+- Example `.env` (SMTP):
+
+```dotenv
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USER=you@gmail.com
+SMTP_PASSWORD=app_password_here
+SMTP_FROM=noreply@example.com
+SMTP_TLS=starttls
+RESULTS_TTL_SECONDS=172800
+```
+
+- Addresses are kept in memory only until the job completes. If sending fails, the job still succeeds and the link remains downloadable via the UI.
 
 ## CLI usage and flags
 

@@ -13,9 +13,12 @@ import tempfile
 import threading
 import time
 from contextlib import contextmanager
+from email.message import EmailMessage
 from typing import Optional, Sequence
+import smtplib
+import ssl
 
-from fastapi import BackgroundTasks, FastAPI, Form
+from fastapi import BackgroundTasks, FastAPI, Form, Request
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, RedirectResponse, JSONResponse
 import httpx
 
@@ -128,7 +131,8 @@ async def _cleanup_loop() -> None:
                 created_at = float(info.get("created_at", 0.0) or 0.0)
                 status = str(info.get("status", ""))
                 # Expire finished/cancelled/error jobs after TTL, and stale running jobs
-                if created_at and (now - created_at) > JOB_TTL_SECONDS:
+                ttl_seconds = float(info.get("ttl_seconds", JOB_TTL_SECONDS) or JOB_TTL_SECONDS)
+                if created_at and (now - created_at) > ttl_seconds:
                     expired.append(job_id)
             for job_id in expired:
                 try:
@@ -197,6 +201,140 @@ def _parse_overpass_urls() -> list[str]:
     return unique
 
 
+def _is_valid_email(value: str) -> bool:
+    if not value or "@" not in value or any(ch.isspace() for ch in value):
+        return False
+    local, _, domain = value.rpartition("@")
+    if not local or not domain or "." not in domain:
+        return False
+    return True
+
+
+def _build_download_url(job_id: str, job_record: dict[str, object]) -> str:
+    base_url = str(job_record.get("base_url") or "")
+    path = f"download/{job_id}"
+    if base_url:
+        base = base_url.rstrip("/") + "/"
+        return base + path
+    return f"/{path}"
+
+
+def _available_email_providers() -> list[str]:
+    providers: list[str] = []
+    if RESEND_API_KEY and EMAIL_FROM:
+        providers.append("resend")
+    if POSTMARK_TOKEN and EMAIL_FROM:
+        providers.append("postmark")
+    if SMTP_HOST and (SMTP_FROM or EMAIL_FROM or SMTP_USER):
+        providers.append("smtp")
+    return providers
+
+
+def _send_email_resend(to_email: str, subject: str, text_body: str, html_body: str | None) -> None:
+    if not (RESEND_API_KEY and EMAIL_FROM):
+        raise RuntimeError("Resend not configured")
+    payload = {
+        "from": EMAIL_FROM,
+        "to": [to_email],
+        "subject": subject,
+        "html": html_body or text_body,
+        "text": text_body,
+    }
+    headers = {"Authorization": f"Bearer {RESEND_API_KEY}"}
+    response = httpx.post(
+        "https://api.resend.com/emails",
+        headers=headers,
+        json=payload,
+        timeout=httpx.Timeout(15.0, connect=5.0, read=15.0),
+    )
+    response.raise_for_status()
+
+
+def _send_email_postmark(to_email: str, subject: str, text_body: str, html_body: str | None) -> None:
+    if not (POSTMARK_TOKEN and EMAIL_FROM):
+        raise RuntimeError("Postmark not configured")
+    payload = {
+        "From": EMAIL_FROM,
+        "To": to_email,
+        "Subject": subject,
+        "HtmlBody": html_body or text_body,
+        "TextBody": text_body,
+        "MessageStream": "outbound",
+    }
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "X-Postmark-Server-Token": POSTMARK_TOKEN,
+    }
+    response = httpx.post(
+        "https://api.postmarkapp.com/email",
+        headers=headers,
+        json=payload,
+        timeout=httpx.Timeout(15.0, connect=5.0, read=15.0),
+    )
+    response.raise_for_status()
+
+
+def _send_email_smtp(to_email: str, subject: str, text_body: str, html_body: str | None) -> None:
+    if not SMTP_HOST:
+        raise RuntimeError("SMTP host not configured")
+    from_addr = SMTP_FROM or EMAIL_FROM or SMTP_USER
+    if not from_addr:
+        raise RuntimeError("SMTP_FROM/EMAIL_FROM not configured")
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = from_addr
+    msg["To"] = to_email
+    msg.set_content(text_body or html_body or "")
+    if html_body:
+        msg.add_alternative(html_body, subtype="html")
+
+    port = int(SMTP_PORT or ("465" if SMTP_MODE == "ssl" else "587"))
+
+    if SMTP_MODE == "ssl":
+        context = ssl.create_default_context()
+        with smtplib.SMTP_SSL(SMTP_HOST, port, context=context, timeout=SMTP_TIMEOUT) as server:
+            if SMTP_USER:
+                server.login(SMTP_USER, SMTP_PASSWORD or "")
+            server.send_message(msg)
+    else:
+        with smtplib.SMTP(SMTP_HOST, port, timeout=SMTP_TIMEOUT) as server:
+            if SMTP_MODE == "starttls":
+                context = ssl.create_default_context()
+                server.starttls(context=context)
+            if SMTP_USER:
+                server.login(SMTP_USER, SMTP_PASSWORD or "")
+            server.send_message(msg)
+
+
+def send_result_email(to_email: str, subject: str, text_body: str, html_body: str | None = None) -> None:
+    providers = _available_email_providers()
+    if not providers:
+        raise RuntimeError("No email provider configured")
+    last_error: Exception | None = None
+    for attempt in range(3):
+        for provider in providers:
+            try:
+                if provider == "resend":
+                    _send_email_resend(to_email, subject, text_body, html_body)
+                elif provider == "postmark":
+                    _send_email_postmark(to_email, subject, text_body, html_body)
+                else:
+                    _send_email_smtp(to_email, subject, text_body, html_body)
+                logger.info("Sent results email to %s via %s", to_email, provider)
+                return
+            except Exception as exc:
+                last_error = exc
+                logger.warning(
+                    "Email delivery via %s failed (attempt %d): %s",
+                    provider,
+                    attempt + 1,
+                    exc,
+                )
+        time.sleep(min(2 ** attempt, 5.0))
+    raise RuntimeError(f"Email delivery failed: {last_error}") from last_error
+
+
 UI_USER_AGENT = os.getenv("UI_USER_AGENT", "JobScraper/0.1 (+https://github.com/novaheic)")
 UI_CONCURRENCY = _env_int("UI_CONCURRENCY", 18)
 UI_MAX_JOB_LINKS = _env_int("UI_MAX_JOB_LINKS", 6)
@@ -206,6 +344,25 @@ UI_LIMIT: Optional[int] = _ui_limit if _ui_limit > 0 else None
 UI_OVERPASS_URLS = _parse_overpass_urls()
 UI_OVERPASS_URL: Optional[str] = UI_OVERPASS_URLS[0] if UI_OVERPASS_URLS else None
 UI_LOG_LEVEL = os.getenv("UI_LOG_LEVEL", "INFO")
+EMAIL_JOB_TTL_SECONDS = max(JOB_TTL_SECONDS, _env_int("RESULTS_TTL_SECONDS", 24 * 60 * 60))
+_raw_email_from = (os.getenv("EMAIL_FROM") or "").strip()
+_raw_smtp_from = (os.getenv("SMTP_FROM") or "").strip()
+EMAIL_FROM = _raw_email_from or (_raw_smtp_from or None)
+SMTP_FROM = _raw_smtp_from or EMAIL_FROM
+RESEND_API_KEY = (os.getenv("RESEND_API_KEY") or "").strip() or None
+POSTMARK_TOKEN = (os.getenv("POSTMARK_TOKEN") or "").strip() or None
+SMTP_HOST = (os.getenv("SMTP_HOST") or "").strip() or None
+SMTP_PORT = (os.getenv("SMTP_PORT") or "").strip() or None
+SMTP_USER = (os.getenv("SMTP_USER") or "").strip() or None
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD") or None
+_smtp_mode_raw = (os.getenv("SMTP_TLS") or "true").strip().lower()
+if _smtp_mode_raw in {"ssl", "smtps"}:
+    SMTP_MODE = "ssl"
+elif _smtp_mode_raw in {"starttls", "tls", "true", "1", "yes"}:
+    SMTP_MODE = "starttls"
+else:
+    SMTP_MODE = "none"
+SMTP_TIMEOUT = float(os.getenv("SMTP_TIMEOUT", "20"))
 MAX_ACTIVE_JOBS = max(1, _env_int("UI_MAX_ACTIVE_JOBS", 3))
 JOB_SEMAPHORE = threading.Semaphore(MAX_ACTIVE_JOBS)
 
@@ -471,6 +628,34 @@ async def _execute_job(
     job_record["status"] = "done"
     job_record["phase"] = "complete"
     job_record["finished_at"] = time.time()
+    notify_email_value = str(job_record.get("notify_email") or "")
+    if notify_email_value:
+        download_url = _build_download_url(job_id, job_record)
+        ttl_seconds = float(job_record.get("ttl_seconds", EMAIL_JOB_TTL_SECONDS) or EMAIL_JOB_TTL_SECONDS)
+        ttl_hours = max(1, int(round(ttl_seconds / 3600)))
+        area_label = str(job_record.get("area") or "your selected area")
+        plural = "" if ttl_hours == 1 else "s"
+        subject = "Your City Gig Scraper CSV is ready"
+        text_body = (
+            f"Hi,\n\n"
+            f"Your City Gig Scraper job for {area_label} is complete.\n"
+            f"Download CSV: {download_url}\n\n"
+            f"The link stays active for about {ttl_hours} hour{plural}.\n"
+            "Thanks for using City Gig Scraper!"
+        )
+        html_body = f"""
+        <p>Hi,</p>
+        <p>Your City Gig Scraper job for <strong>{area_label}</strong> is complete.</p>
+        <p><a href="{download_url}">Download your CSV</a></p>
+        <p>The link stays active for about {ttl_hours} hour{plural}.</p>
+        <p>Thanks for using City Gig Scraper!</p>
+        """
+        try:
+            send_result_email(notify_email_value, subject, text_body, html_body)
+            job_record["email_sent_at"] = time.time()
+        except Exception as exc:
+            logger.warning("Failed to send completion email to %s: %s", notify_email_value, exc)
+            job_record["email_error"] = str(exc)
 
 
 def _run_job_sync(*, job_id: str, **kwargs) -> None:
@@ -701,14 +886,25 @@ def index() -> str:
         <div class="amenity-pills">
           {pill_markup}
         </div>
-        <div class="amenity-actions">
+      <div class="amenity-actions">
           <button type="button" id="select-all-amenities" data-mode="select">Select all amenities</button>
         </div>
       </div>
       <div id="amenities-error" class="error-text" style="display:none;"></div>
       <!-- splitting is adaptive; no UI control -->
 
-      <div class="run-controls">
+    <div class="run-controls">
+      <label id="notify-email-field" style="margin-top: 1.25rem; display:block;">
+        Email me the download link (optional)
+        <input
+          type="email"
+          name="notify_email"
+          id="notify-email-input"
+          placeholder="you@example.com"
+          style="margin-top:0.4rem;"
+        />
+      </label>
+      <div id="notify-email-error" class="error-text" style="display:none;"></div>
         <button type="submit" id="run-button" data-state="idle">Run scrape</button>
         <span id="run-status" class="hint" style="margin-left: 0.75rem;"></span>
       </div>
@@ -825,7 +1021,11 @@ def index() -> str:
       const downloadLink = document.getElementById("download-link");
       const areaField = document.getElementById("area-field");
       const areaError = document.getElementById("area-error");
+      const amenitiesField = document.querySelector(".amenities-section");
       const amenitiesError = document.getElementById("amenities-error");
+      const notifyEmailInput = document.getElementById("notify-email-input");
+      const notifyEmailField = document.getElementById("notify-email-field");
+      const notifyEmailError = document.getElementById("notify-email-error");
       const jobsStartedEl = document.getElementById("jobs-started");
       let currentJobId = null;
       let pollTimer = null;
@@ -1012,13 +1212,21 @@ def index() -> str:
         }}
       }});
 
+      if (notifyEmailInput) {{
+        notifyEmailInput.addEventListener("input", () => {{
+          if (notifyEmailField) {{
+            clearFieldError(notifyEmailField, notifyEmailError);
+          }}
+        }});
+      }}
+
       function validateAmenities() {{
         const val = hiddenAmenities.value.trim();
         if (!val) {{
-          showFieldError(document.querySelector(".amenities-section"), amenitiesError, "Please select at least one category.");
+          showFieldError(amenitiesField, amenitiesError, "Please select at least one category.");
           return false;
         }}
-        clearFieldError(document.querySelector(".amenities-section"), amenitiesError);
+        clearFieldError(amenitiesField, amenitiesError);
         return true;
       }}
 
@@ -1049,6 +1257,18 @@ def index() -> str:
         if (!validateAmenities()) {{
           valid = false;
         }}
+        if (notifyEmailInput) {{
+          const emailVal = notifyEmailInput.value.trim();
+          if (emailVal && !/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(emailVal)) {{
+            showFieldError(notifyEmailField, notifyEmailError, "Please enter a valid email address.");
+            if (valid) {{
+              notifyEmailInput.focus();
+            }}
+            valid = false;
+          }} else {{
+            clearFieldError(notifyEmailField, notifyEmailError);
+          }}
+        }}
         if (!valid) {{
           return;
         }}
@@ -1066,6 +1286,9 @@ def index() -> str:
         previewContainer.hidden = true;
         downloadLink.style.display = "none";
         runStatus.textContent = "";
+        if (notifyEmailField) {{
+          clearFieldError(notifyEmailField, notifyEmailError);
+        }}
         try {{
           const formData = new FormData(formEl);
           const res = await fetch("/run", {{ method: "POST", body: formData }});
@@ -1073,7 +1296,8 @@ def index() -> str:
             const data = await res.json().catch(() => ({{}}));
             if (data && data.error === "validation") {{
               if (data.area) showFieldError(areaField, areaError, data.area);
-              if (data.amenities) showFieldError(document.querySelector(".amenities-section"), amenitiesError, data.amenities);
+              if (data.amenities) showFieldError(amenitiesField, amenitiesError, data.amenities);
+              if (data.notify_email) showFieldError(notifyEmailField, notifyEmailError, data.notify_email);
               setRunState("idle");
               return;
             }}
@@ -1113,15 +1337,21 @@ def index() -> str:
 
 @app.post("/run")
 def run(
+    request: Request,
     background: BackgroundTasks,
     area: str = Form(DEFAULT_AREA),
     amenities: str = Form(DEFAULT_AMENITY_STRING),
+    notify_email: str | None = Form(None),
 ):
     # Server-side validation
     if not (area and area.strip()):
         return JSONResponse({"error": "validation", "area": "Please enter a city."}, status_code=400)
     if not (amenities and amenities.strip()):
         return JSONResponse({"error": "validation", "amenities": "Please select at least one amenity."}, status_code=400)
+
+    email_value: str | None = notify_email.strip() if notify_email else None
+    if email_value and not _is_valid_email(email_value):
+        return JSONResponse({"error": "validation", "notify_email": "Please enter a valid email address."}, status_code=400)
 
     job_id = uuid.uuid4().hex[:10]
     output_path = OUTPUT_DIR / f"{job_id}.csv"
@@ -1132,6 +1362,15 @@ def run(
         "created_at": time.time(),
         "queued_at": time.time(),
     }
+    JOBS[job_id]["area"] = area
+    JOBS[job_id]["amenities"] = amenities
+    JOBS[job_id]["base_url"] = str(request.base_url)
+    if email_value:
+        JOBS[job_id]["notify_email"] = email_value
+    ttl_seconds = JOB_TTL_SECONDS
+    if email_value:
+        ttl_seconds = max(ttl_seconds, EMAIL_JOB_TTL_SECONDS)
+    JOBS[job_id]["ttl_seconds"] = ttl_seconds
 
     background.add_task(
         _run_job_sync,
