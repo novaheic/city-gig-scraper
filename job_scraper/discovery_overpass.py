@@ -200,7 +200,7 @@ def _resolve_area_relation_id(
 
     owns_client = client is None
     if owns_client:
-        client = httpx.Client(timeout=httpx.Timeout(60.0, connect=10.0, read=30.0))
+        client = httpx.Client(timeout=httpx.Timeout(60.0, connect=10.0, read=45.0))
 
     assert client is not None
 
@@ -208,7 +208,7 @@ def _resolve_area_relation_id(
 
     # Query for relations matching the area name and include tags for ranking
     query = f"""
-[out:json][timeout:25];
+[out:json][timeout:60];
 relation["name"="{area_name}"]["type"~"^(boundary|administrative)$"]["admin_level"];
 out ids tags;
 """
@@ -304,7 +304,7 @@ def get_sub_areas(
     """
     owns_client = client is None
     if owns_client:
-        client = httpx.Client(timeout=httpx.Timeout(60.0, connect=10.0, read=30.0))
+        client = httpx.Client(timeout=httpx.Timeout(60.0, connect=10.0, read=45.0))
 
     assert client is not None
 
@@ -324,7 +324,7 @@ def get_sub_areas(
     # Query for sub-relations (districts) within the parent area
     # Look for relations that are members of the parent relation with appropriate admin_level
     query = f"""
-[out:json][timeout:25];
+[out:json][timeout:60];
 relation({parent_id});
 rel(r)["admin_level"~"^(6|7|8|9|10)$"]["type"="boundary"]["name"];
 out tags;
@@ -387,7 +387,7 @@ def _get_relation_bbox(
     """Return (south, west, north, east) bbox for a relation via Overpass."""
     owns_client = client is None
     if owns_client:
-        client = httpx.Client(timeout=httpx.Timeout(60.0, connect=10.0, read=30.0))
+        client = httpx.Client(timeout=httpx.Timeout(60.0, connect=10.0, read=45.0))
 
     assert client is not None
 
@@ -399,7 +399,7 @@ def _get_relation_bbox(
     urls = _normalize_overpass_urls(overpass_url, overpass_urls)
 
     query = f"""
-[out:json][timeout:25];
+[out:json][timeout:60];
 relation({relation_id});
 out bb;
 """
@@ -612,7 +612,7 @@ def fetch_places_by_grid(
     """Resolve city bbox and query in a grid to avoid Overpass timeouts."""
     owns_client = client is None
     if owns_client:
-        client = httpx.Client(timeout=httpx.Timeout(60.0, connect=10.0, read=30.0))
+        client = httpx.Client(timeout=httpx.Timeout(60.0, connect=10.0, read=45.0))
 
     assert client is not None
 
@@ -735,7 +735,7 @@ def fetch_places(
 
     owns_client = client is None
     if owns_client:
-        client = httpx.Client(timeout=httpx.Timeout(60.0, connect=10.0, read=30.0))
+        client = httpx.Client(timeout=httpx.Timeout(60.0, connect=10.0, read=45.0))
 
     assert client is not None  # for type checkers
 
