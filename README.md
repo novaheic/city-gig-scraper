@@ -1,240 +1,183 @@
 # City Gig Scraper
 
-Discover hospitality venues from OpenStreetMap and scan their websites for hiring pages/signals. Export results to CSV. Use it via a friendly Web UI or the original CLI.
+**Looking for service jobs in your city? This tool does the legwork for you.**
 
-- Built on Overpass (OSM) discovery + polite, async crawling
-- Detects job/career pages and common hiring keywords
-- CSV export, with preview and download in the UI
+![City Gig Scraper UI](UI.PNG)
 
-Originally created for Berlin‑Mitte; now works for any city as long as OSM has coverage.
+Job hunting in hospitality—cafes, restaurants, bars—is frustrating. Every place has its own website (if any), and finding their "We're hiring!" pages means clicking through dozens of sites one by one.
 
-## Quick start
+City Gig Scraper automates this:
+1. Finds all venues of your chosen type (cafes, bars, restaurants, etc.) in your city using OpenStreetMap
+2. Visits their websites and looks for job/career pages
+3. Exports everything to a CSV you can open in Excel or Google Sheets
 
-### 1) Install
+Now you have one list to review, filter, and work through systematically.
+
+---
+
+## 🌐 Use the hosted version (easiest)
+
+**[city-gig-scraper.onrender.com](https://city-gig-scraper.onrender.com)**
+
+No setup required. Just:
+1. Enter your city (e.g., Berlin, New York, Madrid)
+2. Pick categories (Cafes, Restaurants, Bars, etc.)
+3. Click "Run scrape"
+4. Download your CSV when ready
+
+### Optional: Get results via email
+
+The hosted version is a bit slower since it's shared. Drop in your email address and we'll send you a download link when your CSV is ready (usually takes a few minutes).
+
+**Privacy**: Nothing is saved. No database, no tracking. CSV files are deleted after 1 hour (or 24 hours if you use email). We only keep your email in memory until the job finishes.
+
+---
+
+## 💻 Run it yourself (faster, full control)
+
+Want faster results or to run large searches? You can run the scraper on your own computer. It's a Python script—no server needed.
+
+### Prerequisites
+
+- Python 3.8 or newer ([download here](https://www.python.org/downloads/))
+- Basic command line familiarity (but we'll walk you through it)
+
+### Setup (one time)
+
+**Windows:**
+
+Open PowerShell in the project folder and run:
 
 ```powershell
 python -m venv .venv
-\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
+.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
-### 2) Run the Web UI
+**Mac/Linux:**
+
+Open Terminal in the project folder and run:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+### Running a scrape
+
+**Windows example:**
 
 ```powershell
-uvicorn web.app:app --host 127.0.0.1 --port 8000 --reload
-```
-
-Open http://127.0.0.1:8000 and:
-- Enter a city (autocomplete helps; e.g., Berlin, Tokyo, New York)
-- Pick categories (amenities) to search (e.g., Cafes, Restaurants, Bars)
-- Click “Run scrape”
-- Watch live progress; when done, preview the first 50 rows and download the CSV
-
-Notes about the UI:
-- Jobs run in the background; you can cancel while running.
-- Downloads are generated in a temporary folder and are kept for ~1 hour.
-- A usage counter is stored at `output/stats.json` (override with the `STATS_FILE` env var).
-
-Set a custom stats path (optional):
-
-```powershell
-$env:STATS_FILE="output\stats.json"
-```
-
-### 3) Or run the CLI
-
-Recommended for bulk runs or automation. Replace the user‑agent with your own contact info.
-
-```powershell
-python -m job_scraper.main `
-  --area "Bezirk Mitte, Berlin" `
-  --output "output/berlin_mitte_jobs.csv" `
-  --user-agent "YourNameJobScraper/0.1 (+https://your.site/contact)" `
-  --concurrency 15 `
-  --max-job-links 10
-```
-
-## Features
-
-- OSM‑powered discovery by amenity types (cafe, restaurant, bar, pub, bakery, fast_food, etc.)
-- Adaptive querying: tries single‑area; falls back to grid tiling on errors/timeouts
-- Optional district splitting for large cities to avoid Overpass timeouts
-- Asynchronous, polite crawling (httpx, configurable concurrency)
-- Heuristic detection of job pages and hiring cues; vendor platform recognition
-- CSV output ready for Google Sheets
-- Minimal Web UI (FastAPI) with city autocomplete, amenity pills, live progress, preview, and download
-
-## Web UI details
-
-- Start locally: `uvicorn web.app:app --host 127.0.0.1 --port 8000 --reload`
-- Home (`/`): submit Location and Categories, then “Run scrape”
-- Status polling and cancellation are built‑in
-- Preview (first 50 rows) is shown when done
-- Download via a button (served from a temporary file)
-- Usage counter endpoint (`/stats`) writes to `output/stats.json` (override with `STATS_FILE`)
-- Temporary CSVs live under your system temp in a `city_gig_scraper_outputs` folder and are auto‑cleaned after ~1 hour
-- Jobs queue automatically when all worker slots are busy. The status indicator shows `Queued… (position/length)` until a slot frees up.
-- `/stats` now supports `HEAD` requests so free uptime monitors can keep the app warm without counting as traffic.
-- Opt-in email notification: enter an address to receive a download link when the CSV is ready (link defaults to 24 h validity)
-
-### Hosting & tuning
-
-Environment variables (usable via `.env`, Render/Railway dashboards, etc.):
-
-- `OVERPASS_URLS`: Comma-separated list of Overpass endpoints. Requests fail over in order. Example: `https://overpass.kumi.systems/api/interpreter,https://overpass.openstreetmap.ru/api/interpreter`
-- `OVERPASS_URL`: Fallback single endpoint (appended to `OVERPASS_URLS`).
-- `UI_CONCURRENCY`: Async crawler concurrency (default 18).
-- `UI_MAX_JOB_LINKS`: Max job links per venue (default 6).
-- `UI_CRAWL_DEPTH`: Internal link depth for job pages (default 3).
-- `UI_LIMIT`: Optional soft cap on venues processed per run.
-- `UI_MAX_ACTIVE_JOBS`: Max concurrent jobs (default 3). Additional runs queue.
-- `UI_USER_AGENT`: Override the polite default header.
-- `UI_LOG_LEVEL`: Logging verbosity (`INFO`/`DEBUG`).
-
-Example `.env` for a hosted instance:
-
-```dotenv
-OVERPASS_URLS=https://overpass.kumi.systems/api/interpreter,https://overpass.openstreetmap.ru/api/interpreter
-UI_CONCURRENCY=10
-UI_MAX_JOB_LINKS=4
-UI_CRAWL_DEPTH=2
-UI_MAX_ACTIVE_JOBS=3
-UPSTASH_REDIS_REST_URL=...           # optional, for persistent counters/cache
-UPSTASH_REDIS_REST_TOKEN=...
-```
-
-Tip: Pair the app with a lightweight uptime ping (e.g., UptimeRobot `HEAD https://your-app/stats` every 10 minutes) to avoid cold starts on free tiers.
-
-### Email notifications
-
-- The Web UI email field is optional. When supplied, the app emails a link once the CSV finishes.
-- Links stay live for one hour by default; emailed jobs automatically extend the TTL to `RESULTS_TTL_SECONDS` (defaults to 86 400 s / 24 h). Adjust as needed.
-- Configure one mail channel (first match wins):
-  - **Resend** – `RESEND_API_KEY`, `EMAIL_FROM`
-  - **Postmark** – `POSTMARK_TOKEN`, `EMAIL_FROM`
-  - **SMTP** – `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM` (optional `EMAIL_FROM`), `SMTP_TLS` (`true`/`starttls`/`ssl`/`none`), optional `SMTP_TIMEOUT`
-- Example `.env` (Resend):
-
-```dotenv
-EMAIL_FROM=noreply@example.com
-RESEND_API_KEY=re_1234567890abcdef
-RESULTS_TTL_SECONDS=86400
-```
-
-- Example `.env` (SMTP):
-
-```dotenv
-SMTP_HOST=smtp.gmail.com
-SMTP_PORT=587
-SMTP_USER=you@gmail.com
-SMTP_PASSWORD=app_password_here
-SMTP_FROM=noreply@example.com
-SMTP_TLS=starttls
-RESULTS_TTL_SECONDS=172800
-```
-
-- Addresses are kept in memory only until the job completes. If sending fails, the job still succeeds and the link remains downloadable via the UI.
-
-## CLI usage and flags
-
-Basic run:
-
-```powershell
-python -m job_scraper.main `
-  --area "Bezirk Mitte, Berlin" `
-  --output "output/berlin_mitte_jobs.csv" `
-  --user-agent "YourNameJobScraper/0.1 (+https://your.site/contact)"
-```
-
-Common flags:
-- **--area**: Administrative area name in OSM. Use exact names where possible.
-- **--amenities**: Comma‑separated OSM amenity types.
-  - Default: `cafe,restaurant,bar,pub,fast_food,bakery,ice_cream,biergarten,food_court`
-- **--output**: CSV path to write results.
-- **--user-agent**: Include your contact info (URL or email) in the header.
-- **--concurrency**: Max concurrent HTTP requests (try 5–18; be polite).
-- **--max-job-links**: Max candidate job links to follow per site.
-- **--crawl-depth**: Max internal link depth (>= 1).
-- **--limit**: Limit number of places (useful for quick tests).
-- **--overpass-url**: Override Overpass endpoint if needed.
-- **--log-level**: `INFO` (default) or `DEBUG` for more detail.
-- **--split-into-districts**: Automatically split large areas into districts to reduce Overpass timeouts.
-
-Scan an entire city with district splitting (recommended for large metros):
-
-```powershell
+.venv\Scripts\Activate.ps1
 python -m job_scraper.main `
   --area "Berlin" `
+  --output "my_berlin_jobs.csv" `
+  --user-agent "JobHunter/1.0 (+mailto:your.email@example.com)"
+```
+
+**Mac/Linux example:**
+
+```bash
+source .venv/bin/activate
+python -m job_scraper.main \
+  --area "Berlin" \
+  --output "my_berlin_jobs.csv" \
+  --user-agent "JobHunter/1.0 (+mailto:your.email@example.com)"
+```
+
+Results will be saved to `my_berlin_jobs.csv` in the same folder.
+
+### Important flags
+
+| Flag | What it does | Example |
+|------|--------------|---------|
+| `--area` | City or district to search | `--area "Munich"` |
+| `--output` | Where to save the CSV | `--output "results.csv"` |
+| `--user-agent` | Identifies you to websites (include your email) | `--user-agent "MyBot/1.0 (+mailto:me@example.com)"` |
+| `--amenities` | Types of places to search (comma-separated) | `--amenities "cafe,bar"` |
+| `--concurrency` | How many sites to check at once (5–18 recommended) | `--concurrency 15` |
+| `--max-job-links` | Max job pages to find per venue | `--max-job-links 10` |
+| `--limit` | Stop after N venues (useful for testing) | `--limit 50` |
+| `--split-into-districts` | Break large cities into smaller areas (avoids timeouts) | Just add the flag |
+
+**Default amenities** (if you don't specify): `cafe,restaurant,bar,pub,fast_food,bakery,ice_cream,biergarten,food_court`
+
+### More examples
+
+**Only cafes in Madrid:**
+
+```powershell
+python -m job_scraper.main --area "Madrid" --amenities cafe --output madrid_cafes.csv --user-agent "YourName/1.0 (+mailto:you@example.com)"
+```
+
+**All hospitality venues in New York (with district splitting for large areas):**
+
+```powershell
+python -m job_scraper.main `
+  --area "New York" `
   --split-into-districts `
-  --output "output/berlin_all_jobs.csv" `
-  --user-agent "YourNameJobScraper/0.1 (+mailto:you@example.com)" `
-  --concurrency 18 `
-  --max-job-links 10
+  --output nyc_all.csv `
+  --user-agent "YourName/1.0 (+mailto:you@example.com)" `
+  --concurrency 18
 ```
 
-Change the amenity mix:
+**Bars and restaurants only in Munich:**
 
 ```powershell
-# Only cafes
-python -m job_scraper.main --area "Berlin" --amenities cafe --output output/cafes_only.csv
-
-# Restaurants and bars only
-python -m job_scraper.main --area "Berlin" --amenities restaurant,bar --output output/restaurants_bars.csv
-
-# Add nightclubs to defaults
-python -m job_scraper.main --area "Berlin" --amenities cafe,restaurant,bar,pub,fast_food,bakery,ice_cream,biergarten,food_court,nightclub
+python -m job_scraper.main --area "Munich" --amenities bar,restaurant --output munich_bars_restaurants.csv --user-agent "YourName/1.0 (+mailto:you@example.com)"
 ```
 
-Tips for areas:
-- Use exact OSM names. Prefer “Frankfurt am Main” over “Frankfurt”.
-- If resolution fails, the tool may fall back to a Berlin‑Mitte bounding box. Double‑check spelling/casing.
-- For quick trials, combine a smaller area with `--limit` (e.g., `--limit 20`).
-- Overpass endpoints can also be supplied via environment variables in the CLI:
-  - `OVERPASS_URLS=https://overpass.kumi.systems/api/interpreter,https://overpass.openstreetmap.ru/api/interpreter`
-  - `OVERPASS_URL=https://overpass-api.de/api/interpreter` (optional single fallback)
-  - CLI honors the same failover logic used by the Web UI.
+### Tips
 
-## Output
+- **City names**: Use the English name OpenStreetMap knows. Try "Frankfurt am Main" instead of just "Frankfurt."
+- **Large cities**: Add `--split-into-districts` to avoid timeouts (Berlin, London, Paris, etc.)
+- **Testing**: Use `--limit 20` to scrape just 20 venues and see how it works
+- **Be polite**: Keep `--concurrency` reasonable (5–18) and always include your contact in `--user-agent`
 
-The CSV schema:
-- `name`: Venue name
-- `type`: OSM amenity type
-- `homepage`: Discovered website
-- `job_page_url`: Detected job/career page (if found)
+---
 
-CLI outputs are written to your chosen `--output` path (commonly under `output/`).
-UI outputs are temporary and downloadable via the browser.
+## 📊 Understanding the output
 
-Google Sheets import:
-1) Copy the CSV contents
-2) Paste into cell A1 in a new Google Sheet (Cmd/Ctrl+Shift+V for plain text)
-3) Data → Split text to columns
+Your CSV will have these columns:
 
-## Politeness and stability
+- **name**: Venue name
+- **type**: Type of place (cafe, restaurant, bar, etc.)
+- **homepage**: Their website
+- **job_page_url**: Link to their hiring/career page (if found)
 
-- Keep concurrency reasonable; be respectful of target sites.
-- Include a real user agent with contact info when using the CLI.
-- Overpass can rate‑limit or time out on large queries; use district splitting for big cities.
-- Provide multiple Overpass mirrors via `OVERPASS_URLS` so the scraper can fail over automatically.
-- Increase `UI_MAX_ACTIVE_JOBS` only if your host has spare CPU/network; otherwise the built-in queue keeps things fair for concurrent users.
+**Heads up**: There will be some false positives. Before applying, quickly check that the job page is real and relevant. I usually:
+1. Open the CSV in Excel/Sheets
+2. Add a "relevant?" column and mark yes/no as I scan through
+3. Filter to "yes" and start applying
 
-## Development
+### Importing to Google Sheets
 
-Project layout:
-- `job_scraper/` — CLI entrypoint and core logic (discovery, crawling, detection)
-- `web/app.py` — FastAPI app for the Web UI
-- `output/` — Default location for CLI outputs and the UI’s `stats.json`
+1. Open your CSV in a text editor and copy everything
+2. Paste into cell A1 in a new Google Sheet
+3. Go to **Data → Split text to columns**
 
-Run the web app in dev:
+---
 
-```powershell
-uvicorn web.app:app --reload
-```
+## 🛠 Work in progress
 
-Run the CLI locally:
+This tool was built for Berlin but should work for most cities with good OpenStreetMap coverage. It might be buggy or miss some venues/pages—that's normal for heuristic detection.
 
-```powershell
-python -m job_scraper.main --area "Bezirk Mitte, Berlin" --output output/test.csv --user-agent "DevTest/0.1 (+mailto:you@example.com)"
-```
+**Found a bug or have a suggestion?** [Open an issue](../../issues) on GitHub. Pull requests welcome!
 
+---
+
+## 📜 License
+
+MIT License – use it, modify it, share it. See [LICENSE](LICENSE) for details.
+
+---
+
+## How it works
+
+1. **Discovery**: Queries OpenStreetMap's Overpass API for venues matching your criteria
+2. **Crawling**: Politely visits each website (respects robots.txt, rate limits)
+3. **Detection**: Looks for job/career pages using keywords, URL patterns, and common hiring platforms
+4. **Export**: Saves everything to CSV
+
+Built with Python, httpx (async), FastAPI (web UI), and OpenStreetMap data.
