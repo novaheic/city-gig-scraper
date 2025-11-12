@@ -1303,36 +1303,28 @@ def index() -> str:
         previewContainer.hidden = true;
         downloadLink.style.display = "none";
         runStatus.textContent = "";
-        if (notifyWrapper) {
+        if (notifyWrapper) {{
           notifyWrapper.style.display = "none";
-        }
-        if (notifyEmailField) {
+        }}
+        if (notifyEmailField) {{
           clearFieldError(notifyEmailField, notifyEmailError);
-        }
-        if (notifyEmailConfirmed) {
+        }}
+        if (notifyEmailConfirmed) {{
           notifyEmailConfirmed.style.display = "none";
           notifyEmailConfirmed.textContent = "";
-        }
-        if (notifyEmailActions) {
+        }}
+        if (notifyEmailActions) {{
           notifyEmailActions.style.display = "none";
-        }
-        if (notifyEmailEdit) {
-          notifyEmailEdit.style.display = "none";
-          notifyEmailEdit.textContent = "Edit";
-        }
-        if (notifyEmailDelete) {
-          notifyEmailDelete.style.display = "none";
-          notifyEmailDelete.textContent = "Remove";
-        }
-        if (notifyEmailInput) {
+        }}
+        if (notifyEmailInput) {{
           notifyEmailInput.value = "";
           notifyEmailInput.style.display = "";
-        }
-        if (notifyEmailConfirm) {
+        }}
+        if (notifyEmailConfirm) {{
           notifyEmailConfirm.style.display = "";
           notifyEmailConfirm.disabled = false;
           notifyEmailConfirm.textContent = "Confirm";
-        }
+        }}
         notifyConfigured = false;
         try {{
           const formData = new FormData(formEl);
@@ -1352,12 +1344,12 @@ def index() -> str:
           currentJobId = data.job_id;
           setRunState("running");
           runStatus.textContent = "Listing places…";
-          if (notifyWrapper) {
+          if (notifyWrapper) {{
             notifyWrapper.style.display = "block";
-          }
-          if (notifyEmailInput) {
+          }}
+          if (notifyEmailInput) {{
             notifyEmailInput.focus();
-          }
+          }}
           // Refresh footer counter after a successful start
           refreshJobsStarted();
           if (pollTimer) clearInterval(pollTimer);
@@ -1368,97 +1360,127 @@ def index() -> str:
         }}
       }});
 
-      if (notifyEmailConfirm) {
-        notifyEmailConfirm.addEventListener("click", async () => {
-          if (!notifyEmailInput) {
+      if (notifyEmailConfirm) {{
+        notifyEmailConfirm.addEventListener("click", async () => {{
+          if (!notifyEmailInput) {{
             return;
-          }
+          }}
           const emailVal = notifyEmailInput.value.trim();
-          if (!emailVal) {
-            showFieldError(notifyEmailField, notifyEmailError, "Email cannot be empty.");
+          if (!emailVal) {{
+            showFieldError(notifyEmailField, notifyEmailError, "Please enter an email address.");
+            notifyEmailInput.focus();
             return;
-          }
-          if (!/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(emailVal)) {
+          }}
+          if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailVal)) {{
             showFieldError(notifyEmailField, notifyEmailError, "Please enter a valid email address.");
+            notifyEmailInput.focus();
             return;
-          }
-          notifyConfigured = true;
+          }}
+          if (!currentJobId) {{
+            showFieldError(notifyEmailField, notifyEmailError, "Start a scrape first.");
+            return;
+          }}
           clearFieldError(notifyEmailField, notifyEmailError);
-          notifyEmailInput.style.display = "none";
-          notifyEmailConfirm.style.display = "none";
-          if (notifyEmailConfirmed) {
-            notifyEmailConfirmed.textContent = `We'll send a download link to ${emailVal}`;
-            notifyEmailConfirmed.style.display = "block";
-          }
-          if (notifyEmailActions) {
-            notifyEmailActions.style.display = "block";
-          }
-        });
-      }
+          notifyEmailConfirm.disabled = true;
+          notifyEmailConfirm.textContent = "Saving…";
+          try {{
+            const res = await fetch(`/set_email/${{currentJobId}}`, {{
+              method: "POST",
+              headers: {{
+                "Content-Type": "application/json"
+              }},
+              body: JSON.stringify({{ notify_email: emailVal }})
+            }});
+            const data = await res.json().catch(() => ({{}}));
+            if (!res.ok || (data && data.error)) {{
+              const message = (data && data.error) || "Could not save email.";
+              showFieldError(notifyEmailField, notifyEmailError, message);
+              notifyEmailConfirm.disabled = false;
+              notifyEmailConfirm.textContent = "Confirm";
+              return;
+            }}
+            notifyConfigured = true;
+            clearFieldError(notifyEmailField, notifyEmailError);
+            notifyEmailInput.style.display = "none";
+            notifyEmailConfirm.style.display = "none";
+            if (notifyEmailConfirmed) {{
+              notifyEmailConfirmed.textContent = `We'll send a download link to ${{emailVal}}`;
+              notifyEmailConfirmed.style.display = "block";
+            }}
+            if (notifyEmailActions) {{
+              notifyEmailActions.style.display = "block";
+            }}
+          }} catch (err) {{
+            showFieldError(notifyEmailField, notifyEmailError, "Could not save email.");
+            notifyEmailConfirm.disabled = false;
+            notifyEmailConfirm.textContent = "Confirm";
+          }}
+        }});
+      }}
 
-      if (notifyEmailEdit) {
-        notifyEmailEdit.addEventListener("click", () => {
-          if (!notifyEmailInput) {
+      if (notifyEmailEdit) {{
+        notifyEmailEdit.addEventListener("click", () => {{
+          if (!notifyEmailInput) {{
             return;
-          }
+          }}
           notifyConfigured = false;
           notifyEmailInput.style.display = "";
           notifyEmailConfirm.style.display = "";
           notifyEmailConfirm.disabled = false;
           notifyEmailConfirm.textContent = "Confirm";
-          if (notifyEmailActions) {
+          if (notifyEmailActions) {{
             notifyEmailActions.style.display = "none";
-          }
-          if (notifyEmailConfirmed) {
+          }}
+          if (notifyEmailConfirmed) {{
             notifyEmailConfirmed.textContent = "";
             notifyEmailConfirmed.style.display = "none";
-          }
+          }}
           notifyEmailInput.focus();
-        });
-      }
+        }});
+      }}
 
-      if (notifyEmailDelete) {
-        notifyEmailDelete.addEventListener("click", async () => {
-          if (!currentJobId) {
+      if (notifyEmailDelete) {{
+        notifyEmailDelete.addEventListener("click", async () => {{
+          if (!currentJobId) {{
             showFieldError(notifyEmailField, notifyEmailError, "Start a scrape first.");
             return;
-          }
+          }}
           notifyEmailDelete.disabled = true;
-          try {
-            const res = await fetch(`/set_email/${currentJobId}`, {
+          try {{
+            const res = await fetch(`/set_email/${{currentJobId}}`, {{
               method: "DELETE"
-            });
-            const data = await res.json().catch(() => ({}));
-            if (!res.ok || (data && data.error)) {
+            }});
+            const data = await res.json().catch(() => ({{}}));
+            if (!res.ok || (data && data.error)) {{
               const message = (data && data.error) || "Could not remove email.";
               showFieldError(notifyEmailField, notifyEmailError, message);
               notifyEmailDelete.disabled = false;
               return;
-            }
+            }}
             notifyConfigured = false;
-            if (notifyEmailInput) {
+            if (notifyEmailInput) {{
               notifyEmailInput.value = "";
               notifyEmailInput.style.display = "";
-            }
-            if (notifyEmailConfirm) {
+            }}
+            if (notifyEmailConfirm) {{
               notifyEmailConfirm.style.display = "";
               notifyEmailConfirm.disabled = false;
               notifyEmailConfirm.textContent = "Confirm";
-            }
-            if (notifyEmailActions) {
+            }}
+            if (notifyEmailActions) {{
               notifyEmailActions.style.display = "none";
-            }
-            if (notifyEmailConfirmed) {
+            }}
+            if (notifyEmailConfirmed) {{
               notifyEmailConfirmed.textContent = "";
               notifyEmailConfirmed.style.display = "none";
-            }
+            }}
             notifyEmailDelete.disabled = false;
-          } catch (err) {
+          }} catch (err) {{
             showFieldError(notifyEmailField, notifyEmailError, "Could not remove email.");
             notifyEmailDelete.disabled = false;
-          }
-        });
-      }
+          }}
+        }});
+      }}
       // Initial footer counter
       window.addEventListener("load", refreshJobsStarted);
     </script>
