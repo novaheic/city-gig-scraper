@@ -487,6 +487,119 @@ out center tags;
     return "\n".join(line.rstrip() for line in query.strip().splitlines()) + "\n"
 
 
+def _try_overpass_query(
+    client: httpx.Client,
+    urls: Sequence[str],
+    query: str,
+    *,
+    attempts: int = 2,
+) -> dict | None:
+    payload: dict | None = None
+    last_error: Exception | None = None
+    for attempt in range(attempts):
+        for url in urls:
+            try:
+                response = client.post(url, data={"data": query})
+                response.raise_for_status()
+                payload = response.json()
+                return payload
+            except Exception as exc:
+                last_error = exc
+                logger.debug(
+                    "Overpass query failed via %s (attempt %d): %s",
+                    url,
+                    attempt + 1,
+                    exc,
+                )
+        time.sleep(0.5 * (attempt + 1))
+    if last_error:
+        logger.warning("Overpass query failed after retries: %s", last_error)
+    return None
+
+
+def _append_places_from_payload(
+    payload: dict,
+    *,
+    all_places: list[Place],
+    seen_websites: set[str],
+) -> None:
+    elements = payload.get("elements", [])
+    for element in elements:
+        tags = element.get("tags") or {}
+        website = _select_website(tags)
+        if not website:
+            continue
+
+        osm_type = element.get("type", "unknown")
+        osm_id = element.get("id")
+        if osm_id is None:
+            continue
+
+        name = tags.get("name") or f"{osm_type.title()} {osm_id}"
+
+        if "lat" in element and "lon" in element:
+            lat = float(element["lat"])
+            lon = float(element["lon"])
+        else:
+            center = element.get("center")
+            if not center or "lat" not in center or "lon" not in center:
+                continue
+            lat = float(center["lat"])
+            lon = float(center["lon"])
+
+        amenity = tags.get("amenity") or "unknown"
+
+        place = Place(
+            osm_id=f"{osm_type}/{osm_id}",
+            name=name,
+            amenity=amenity,
+            latitude=lat,
+            longitude=lon,
+            website=_normalize_website(website),
+        )
+        normalized_url = place.website.lower().rstrip("/")
+        if normalized_url not in seen_websites:
+            seen_websites.add(normalized_url)
+            all_places.append(place)
+
+
+def _fetch_grid_recursive(
+    s: float,
+    w: float,
+    n: float,
+    e: float,
+    *,
+    amenities: Iterable[str],
+    urls: Sequence[str],
+    client: httpx.Client,
+    all_places: list[Place],
+    seen_websites: set[str],
+    depth: int,
+    max_depth: int,
+) -> None:
+    query = _build_bbox_query(s, w, n, e, amenities)
+    payload = _try_overpass_query(client, urls, query, attempts=2)
+    if payload is not None:
+        _append_places_from_payload(payload, all_places=all_places, seen_websites=seen_websites)
+        return
+    if depth >= max_depth:
+        logger.debug("Giving up on bbox at depth %d: (%f,%f,%f,%f)", depth, s, w, n, e)
+        return
+    # Subdivide 2x2 and recurse
+    subtiles = _tile_bbox(s, w, n, e, tiles_per_side=2)
+    for (s2, w2, n2, e2) in subtiles:
+        _fetch_grid_recursive(
+            s2, w2, n2, e2,
+            amenities=amenities,
+            urls=urls,
+            client=client,
+            all_places=all_places,
+            seen_websites=seen_websites,
+            depth=depth + 1,
+            max_depth=max_depth,
+        )
+
+
 def fetch_places_by_grid(
     area: str,
     amenities: Iterable[str],
@@ -535,83 +648,21 @@ def fetch_places_by_grid(
             return []
 
         south, west, north, east = bbox
-        tiles = _tile_bbox(south, west, north, east, tiles_per_side=tiles_per_side)
-
         all_places: list[Place] = []
         seen_websites: set[str] = set()
 
-        for idx, (s, w, n, e) in enumerate(tiles, 1):
-            logger.info("Grid tile %d/%d for %s: (%f,%f,%f,%f)", idx, len(tiles), area, s, w, n, e)
-            query = _build_bbox_query(s, w, n, e, amenities)
-
-            payload = None
-            last_error: Exception | None = None
-            for attempt in range(2):
-                for url in urls:
-                    try:
-                        response = client.post(url, data={"data": query})
-                        response.raise_for_status()
-                        payload = response.json()
-                        break
-                    except Exception as exc:
-                        last_error = exc
-                        logger.debug(
-                            "Overpass failed for tile %d/%d via %s (attempt %d): %s",
-                            idx,
-                            len(tiles),
-                            url,
-                            attempt + 1,
-                            exc,
-                        )
-                if payload is not None:
-                    break
-                time.sleep(0.5 * (attempt + 1))
-
-            if payload is None:
-                logger.warning("Overpass failed for tile %d/%d: %s", idx, len(tiles), last_error)
-                continue
-
-            elements = payload.get("elements", [])
-            for element in elements:
-                tags = element.get("tags") or {}
-                website = _select_website(tags)
-                if not website:
-                    continue
-
-                osm_type = element.get("type", "unknown")
-                osm_id = element.get("id")
-                if osm_id is None:
-                    continue
-
-                name = tags.get("name") or f"{osm_type.title()} {osm_id}"
-
-                if "lat" in element and "lon" in element:
-                    lat = float(element["lat"])
-                    lon = float(element["lon"])
-                else:
-                    center = element.get("center")
-                    if not center or "lat" not in center or "lon" not in center:
-                        continue
-                    lat = float(center["lat"])
-                    lon = float(center["lon"])
-
-                amenity = tags.get("amenity") or "unknown"
-
-                place = Place(
-                    osm_id=f"{osm_type}/{osm_id}",
-                    name=name,
-                    amenity=amenity,
-                    latitude=lat,
-                    longitude=lon,
-                    website=_normalize_website(website),
-                )
-
-                normalized_url = place.website.lower().rstrip("/")
-                if normalized_url not in seen_websites:
-                    seen_websites.add(normalized_url)
-                    all_places.append(place)
-
-        logger.info("Grid results: %d unique places across %d tiles for %s", len(all_places), len(tiles), area)
+        # Adaptive recursive grid: start with the full bbox; split sub-tiles on failures up to 2 levels
+        _fetch_grid_recursive(
+            south, west, north, east,
+            amenities=amenities,
+            urls=urls,
+            client=client,
+            all_places=all_places,
+            seen_websites=seen_websites,
+            depth=0,
+            max_depth=2,
+        )
+        logger.info("Grid results: %d unique places after adaptive tiling for %s", len(all_places), area)
         return all_places
     finally:
         if owns_client:
