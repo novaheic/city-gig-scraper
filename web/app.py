@@ -1409,7 +1409,7 @@ def index() -> str:
         }}
         if (notifyEmailInput) {{
           const emailVal = notifyEmailInput.value.trim();
-          if (emailVal && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailVal)) {{
+          if (emailVal && !/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(emailVal)) {{
             showFieldError(notifyEmailField, notifyEmailError, "Please enter a valid email address.");
             valid = false;
           }} else {{
@@ -1552,7 +1552,7 @@ def index() -> str:
             showFieldError(notifyEmailField, notifyEmailError, "Please enter an email address.");
             return;
           }}
-          if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailVal)) {{
+          if (!/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(emailVal)) {{
             showFieldError(notifyEmailField, notifyEmailError, "Please enter a valid email address.");
             return;
           }}
