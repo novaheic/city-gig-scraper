@@ -18,7 +18,7 @@ from typing import Optional, Sequence
 import smtplib
 import ssl
 
-from fastapi import BackgroundTasks, FastAPI, Form, Request
+from fastapi import BackgroundTasks, FastAPI, Form, Request, Body
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, RedirectResponse, JSONResponse
 import httpx
 
@@ -894,19 +894,29 @@ def index() -> str:
       <!-- splitting is adaptive; no UI control -->
 
     <div class="run-controls">
-      <label id="notify-email-field" style="margin-top: 1.25rem; display:block;">
-        Email me the download link (optional)
-        <input
-          type="email"
-          name="notify_email"
-          id="notify-email-input"
-          placeholder="you@example.com"
-          style="margin-top:0.4rem;"
-        />
-      </label>
-      <div id="notify-email-error" class="error-text" style="display:none;"></div>
         <button type="submit" id="run-button" data-state="idle">Run scrape</button>
         <span id="run-status" class="hint" style="margin-left: 0.75rem;"></span>
+      </div>
+      <div id="notify-email-wrapper" style="margin-top:1.1rem; display:none;">
+        <label id="notify-email-field" style="display:block;font-weight:500;">
+          This might take a while—drop your email and we’ll send you the CSV when we’re done.
+          <div style="display:flex;gap:0.6rem;align-items:center;margin-top:0.4rem;">
+            <input
+              type="email"
+              name="notify_email"
+              id="notify-email-input"
+              placeholder="you@example.com"
+              style="flex:1;"
+            />
+            <button type="button" id="notify-email-confirm" style="margin:0;padding:0.55rem 1rem;">Confirm</button>
+          </div>
+        </label>
+        <div id="notify-email-error" class="error-text" style="display:none;"></div>
+        <div id="notify-email-confirmed" class="hint" style="margin-top:0.4rem;display:none;"></div>
+        <div id="notify-email-actions" style="margin-top:0.4rem;display:none;">
+          <button type="button" id="notify-email-edit" style="margin-right:0.6rem;">Edit</button>
+          <button type="button" id="notify-email-delete">Remove</button>
+        </div>
       </div>
       <div id="preview-container" style="margin-top: 1.25rem;" hidden>
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem;">
@@ -1023,12 +1033,19 @@ def index() -> str:
       const areaError = document.getElementById("area-error");
       const amenitiesField = document.querySelector(".amenities-section");
       const amenitiesError = document.getElementById("amenities-error");
+      const notifyWrapper = document.getElementById("notify-email-wrapper");
       const notifyEmailInput = document.getElementById("notify-email-input");
       const notifyEmailField = document.getElementById("notify-email-field");
       const notifyEmailError = document.getElementById("notify-email-error");
+      const notifyEmailConfirm = document.getElementById("notify-email-confirm");
+      const notifyEmailConfirmed = document.getElementById("notify-email-confirmed");
+      const notifyEmailActions = document.getElementById("notify-email-actions");
+      const notifyEmailEdit = document.getElementById("notify-email-edit");
+      const notifyEmailDelete = document.getElementById("notify-email-delete");
       const jobsStartedEl = document.getElementById("jobs-started");
       let currentJobId = null;
       let pollTimer = null;
+      let notifyConfigured = false;
 
       async function refreshJobsStarted() {{
         try {{
@@ -1286,9 +1303,37 @@ def index() -> str:
         previewContainer.hidden = true;
         downloadLink.style.display = "none";
         runStatus.textContent = "";
-        if (notifyEmailField) {{
+        if (notifyWrapper) {
+          notifyWrapper.style.display = "none";
+        }
+        if (notifyEmailField) {
           clearFieldError(notifyEmailField, notifyEmailError);
-        }}
+        }
+        if (notifyEmailConfirmed) {
+          notifyEmailConfirmed.style.display = "none";
+          notifyEmailConfirmed.textContent = "";
+        }
+        if (notifyEmailActions) {
+          notifyEmailActions.style.display = "none";
+        }
+        if (notifyEmailEdit) {
+          notifyEmailEdit.style.display = "none";
+          notifyEmailEdit.textContent = "Edit";
+        }
+        if (notifyEmailDelete) {
+          notifyEmailDelete.style.display = "none";
+          notifyEmailDelete.textContent = "Remove";
+        }
+        if (notifyEmailInput) {
+          notifyEmailInput.value = "";
+          notifyEmailInput.style.display = "";
+        }
+        if (notifyEmailConfirm) {
+          notifyEmailConfirm.style.display = "";
+          notifyEmailConfirm.disabled = false;
+          notifyEmailConfirm.textContent = "Confirm";
+        }
+        notifyConfigured = false;
         try {{
           const formData = new FormData(formEl);
           const res = await fetch("/run", {{ method: "POST", body: formData }});
@@ -1307,6 +1352,12 @@ def index() -> str:
           currentJobId = data.job_id;
           setRunState("running");
           runStatus.textContent = "Listing places…";
+          if (notifyWrapper) {
+            notifyWrapper.style.display = "block";
+          }
+          if (notifyEmailInput) {
+            notifyEmailInput.focus();
+          }
           // Refresh footer counter after a successful start
           refreshJobsStarted();
           if (pollTimer) clearInterval(pollTimer);
@@ -1316,6 +1367,98 @@ def index() -> str:
           setRunState("idle");
         }}
       }});
+
+      if (notifyEmailConfirm) {
+        notifyEmailConfirm.addEventListener("click", async () => {
+          if (!notifyEmailInput) {
+            return;
+          }
+          const emailVal = notifyEmailInput.value.trim();
+          if (!emailVal) {
+            showFieldError(notifyEmailField, notifyEmailError, "Email cannot be empty.");
+            return;
+          }
+          if (!/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(emailVal)) {
+            showFieldError(notifyEmailField, notifyEmailError, "Please enter a valid email address.");
+            return;
+          }
+          notifyConfigured = true;
+          clearFieldError(notifyEmailField, notifyEmailError);
+          notifyEmailInput.style.display = "none";
+          notifyEmailConfirm.style.display = "none";
+          if (notifyEmailConfirmed) {
+            notifyEmailConfirmed.textContent = `We'll send a download link to ${emailVal}`;
+            notifyEmailConfirmed.style.display = "block";
+          }
+          if (notifyEmailActions) {
+            notifyEmailActions.style.display = "block";
+          }
+        });
+      }
+
+      if (notifyEmailEdit) {
+        notifyEmailEdit.addEventListener("click", () => {
+          if (!notifyEmailInput) {
+            return;
+          }
+          notifyConfigured = false;
+          notifyEmailInput.style.display = "";
+          notifyEmailConfirm.style.display = "";
+          notifyEmailConfirm.disabled = false;
+          notifyEmailConfirm.textContent = "Confirm";
+          if (notifyEmailActions) {
+            notifyEmailActions.style.display = "none";
+          }
+          if (notifyEmailConfirmed) {
+            notifyEmailConfirmed.textContent = "";
+            notifyEmailConfirmed.style.display = "none";
+          }
+          notifyEmailInput.focus();
+        });
+      }
+
+      if (notifyEmailDelete) {
+        notifyEmailDelete.addEventListener("click", async () => {
+          if (!currentJobId) {
+            showFieldError(notifyEmailField, notifyEmailError, "Start a scrape first.");
+            return;
+          }
+          notifyEmailDelete.disabled = true;
+          try {
+            const res = await fetch(`/set_email/${currentJobId}`, {
+              method: "DELETE"
+            });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok || (data && data.error)) {
+              const message = (data && data.error) || "Could not remove email.";
+              showFieldError(notifyEmailField, notifyEmailError, message);
+              notifyEmailDelete.disabled = false;
+              return;
+            }
+            notifyConfigured = false;
+            if (notifyEmailInput) {
+              notifyEmailInput.value = "";
+              notifyEmailInput.style.display = "";
+            }
+            if (notifyEmailConfirm) {
+              notifyEmailConfirm.style.display = "";
+              notifyEmailConfirm.disabled = false;
+              notifyEmailConfirm.textContent = "Confirm";
+            }
+            if (notifyEmailActions) {
+              notifyEmailActions.style.display = "none";
+            }
+            if (notifyEmailConfirmed) {
+              notifyEmailConfirmed.textContent = "";
+              notifyEmailConfirmed.style.display = "none";
+            }
+            notifyEmailDelete.disabled = false;
+          } catch (err) {
+            showFieldError(notifyEmailField, notifyEmailError, "Could not remove email.");
+            notifyEmailDelete.disabled = false;
+          }
+        });
+      }
       // Initial footer counter
       window.addEventListener("load", refreshJobsStarted);
     </script>
@@ -1387,6 +1530,77 @@ def run(
         overpass_urls=UI_OVERPASS_URLS,
     )
     return {"job_id": job_id}
+
+@app.post("/set_email/{job_id}")
+def set_email(job_id: str, payload: dict = Body(...)):
+    job = JOBS.get(job_id)
+    if not job:
+        return JSONResponse({"error": "Unknown job."}, status_code=404)
+
+    email_value = str(payload.get("notify_email", "") or "").strip()
+    if not email_value or not _is_valid_email(email_value):
+        return JSONResponse({"error": "Please enter a valid email address."}, status_code=400)
+
+    status = str(job.get("status", ""))
+    if status == "cancelled":
+        return JSONResponse({"error": "Job was cancelled."}, status_code=400)
+
+    job["notify_email"] = email_value
+    ttl_seconds = float(job.get("ttl_seconds", JOB_TTL_SECONDS) or JOB_TTL_SECONDS)
+    if ttl_seconds < EMAIL_JOB_TTL_SECONDS:
+        job["ttl_seconds"] = EMAIL_JOB_TTL_SECONDS
+
+    # ensure base_url exists (fallback to empty string)
+    job.setdefault("base_url", "")
+
+    if status == "done":
+        try:
+            download_url = _build_download_url(job_id, job)
+            ttl_hours = max(1, int(round(float(job.get("ttl_seconds", EMAIL_JOB_TTL_SECONDS) or EMAIL_JOB_TTL_SECONDS) / 3600)))
+            area_label = str(job.get("area") or "your selected area")
+            plural = "" if ttl_hours == 1 else "s"
+            subject = "Your City Gig Scraper CSV is ready"
+            text_body = (
+                f"Hi,\n\n"
+                f"Your City Gig Scraper job for {area_label} is complete.\n"
+                f"Download CSV: {download_url}\n\n"
+                f"The link stays active for about {ttl_hours} hour{plural}.\n"
+                "Thanks for using City Gig Scraper!"
+            )
+            html_body = f"""
+            <p>Hi,</p>
+            <p>Your City Gig Scraper job for <strong>{area_label}</strong> is complete.</p>
+            <p><a href=\"{download_url}\">Download your CSV</a></p>
+            <p>The link stays active for about {ttl_hours} hour{plural}.</p>
+            <p>Thanks for using City Gig Scraper!</p>
+            """
+            send_result_email(email_value, subject, text_body, html_body)
+            job["email_sent_at"] = time.time()
+            job.pop("email_error", None)
+        except Exception as exc:  # pragma: no cover
+            job["email_error"] = str(exc)
+            return JSONResponse({"error": f"Failed to send email: {exc}"}, status_code=500)
+
+    return {"ok": True}
+
+
+@app.delete("/set_email/{job_id}")
+def delete_email(job_id: str):
+    job = JOBS.get(job_id)
+    if not job:
+        return JSONResponse({"error": "Unknown job."}, status_code=404)
+
+    status = str(job.get("status", ""))
+    if status == "cancelled":
+        return JSONResponse({"error": "Job was cancelled."}, status_code=400)
+
+    job.pop("notify_email", None)
+    job.pop("email_error", None)
+    job.pop("email_sent_at", None)
+    # Revert TTL to default if it was extended for email
+    job["ttl_seconds"] = JOB_TTL_SECONDS
+
+    return {"ok": True}
 
 @app.get("/stats")
 def stats():
