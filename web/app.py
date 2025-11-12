@@ -962,7 +962,7 @@ def index() -> str:
           }}
           if (data.status === "queued") {{
             if (typeof data.queue_position === "number" && typeof data.queue_length === "number") {{
-              runStatus.textContent = `Queued… waiting for an available slot (${data.queue_position}/${data.queue_length}).`;
+              runStatus.textContent = `Queued… waiting for an available slot (${{data.queue_position}}/${{data.queue_length}}).`;
             }} else {{
               runStatus.textContent = "Queued… waiting for an available slot.";
             }}
