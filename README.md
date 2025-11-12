@@ -41,6 +41,22 @@ The hosted version is a bit slower since it's shared. Drop in your email address
 
 Want faster results or to run large searches? You can run the scraper on your own computer. It's a Python script—no server needed.
 
+### Get the code
+
+- Option A (easiest): On the GitHub page for this project, click `Code` → `Download ZIP`. Unzip it somewhere like `Documents\city-gig-scraper`.
+- Option B (git users): Clone it
+
+```bash
+git clone https://github.com/yourname/city-gig-scraper.git
+cd city-gig-scraper
+```
+
+### Open a terminal in the project folder
+
+- Windows: Open the folder in File Explorer, right‑click → “Open in Terminal” (or click the address bar, type `powershell`, press Enter).
+- Mac: Open the folder in Finder, right‑click → “New Terminal at Folder” (or open Terminal and `cd` to the folder).
+- Linux: Open your terminal and `cd` to the folder.
+
 ### Prerequisites
 
 - Python 3.8 or newer ([download here](https://www.python.org/downloads/))
@@ -53,6 +69,7 @@ Want faster results or to run large searches? You can run the scraper on your ow
 Open PowerShell in the project folder and run:
 
 ```powershell
+# If 'python' is not found, try 'py' instead of 'python'
 python -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
@@ -70,12 +87,15 @@ pip install -r requirements.txt
 
 ### Running a scrape
 
+Start with a quick test (limits the number of places so you can see results fast).
+
 **Windows example:**
 
 ```powershell
 .venv\Scripts\Activate.ps1
 python -m job_scraper.main `
   --area "Berlin" `
+  --limit 20 `
   --output "my_berlin_jobs.csv" `
   --user-agent "JobHunter/1.0 (+mailto:your.email@example.com)"
 ```
@@ -86,11 +106,17 @@ python -m job_scraper.main `
 source .venv/bin/activate
 python -m job_scraper.main \
   --area "Berlin" \
+  --limit 20 \
   --output "my_berlin_jobs.csv" \
   --user-agent "JobHunter/1.0 (+mailto:your.email@example.com)"
 ```
 
 Results will be saved to `my_berlin_jobs.csv` in the same folder.
+
+#### Troubleshooting
+- “python: command not found”: On Windows try `py` instead of `python`. On macOS/Linux use `python3`.
+- PowerShell blocks activation: Run `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` once in an admin PowerShell, then try activating `.venv` again.
+- Upgrade pip if installs fail: `python -m pip install --upgrade pip`
 
 ### Important flags
 
