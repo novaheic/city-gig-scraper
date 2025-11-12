@@ -16,6 +16,7 @@ from typing import Optional
 
 from fastapi import BackgroundTasks, FastAPI, Form
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, RedirectResponse, JSONResponse
+import httpx
 
 from job_scraper.main import DEFAULT_AREA, main as cli_main
 from job_scraper.main import _process_place as _main_process_place  # type: ignore
@@ -49,6 +50,11 @@ STATS_DIR.mkdir(parents=True, exist_ok=True)
 _ENV_STATS_FILE = os.getenv("STATS_FILE")
 COUNTER_FILE = Path(_ENV_STATS_FILE) if _ENV_STATS_FILE else (STATS_DIR / "stats.json")
 
+# Optional persistent counter via Upstash Redis (free-tier friendly)
+REDIS_URL = os.getenv("UPSTASH_REDIS_REST_URL")
+REDIS_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
+COUNTER_KEY_NAME = os.getenv("COUNTER_KEY", "jobs_started")
+
 def _load_stats() -> dict[str, int]:
     try:
         if COUNTER_FILE.exists():
@@ -71,10 +77,41 @@ def _save_stats(stats: dict[str, int]) -> None:
         # best-effort; ignore errors
         pass
 
+# ---- Redis-backed counter helpers (fallback to file) ----
+def _redis_enabled() -> bool:
+    return bool(REDIS_URL and REDIS_TOKEN)
+
+def _redis_headers() -> dict[str, str]:
+    return {"Authorization": f"Bearer {REDIS_TOKEN}"}
+
 def _get_jobs_started() -> int:
+    # Prefer Redis if configured
+    if _redis_enabled():
+        try:
+            resp = httpx.get(f"{REDIS_URL}/get/{COUNTER_KEY_NAME}", headers=_redis_headers(), timeout=5.0)
+            if resp.status_code == 200:
+                data = resp.json()
+                val = data.get("result")
+                return int(val or 0)
+        except Exception:
+            # fall through to file
+            pass
+    # File fallback (local/dev)
     return int(_load_stats().get("jobs_started", 0))
 
 def _increment_jobs_started(amount: int = 1) -> int:
+    # Prefer Redis if configured
+    if _redis_enabled():
+        try:
+            resp = httpx.get(f"{REDIS_URL}/incrby/{COUNTER_KEY_NAME}/{int(amount)}", headers=_redis_headers(), timeout=5.0)
+            if resp.status_code == 200:
+                data = resp.json()
+                val = data.get("result")
+                return int(val or 0)
+        except Exception:
+            # fall through to file
+            pass
+    # File fallback (local/dev)
     stats = _load_stats()
     stats["jobs_started"] = int(stats.get("jobs_started", 0)) + int(amount)
     _save_stats(stats)
