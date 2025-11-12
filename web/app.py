@@ -10,9 +10,10 @@ import json
 import logging
 import os
 import tempfile
+import threading
 import time
-import json
-from typing import Optional
+from contextlib import contextmanager
+from typing import Optional, Sequence
 
 from fastapi import BackgroundTasks, FastAPI, Form
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, RedirectResponse, JSONResponse
@@ -147,6 +148,15 @@ app = FastAPI(title="City Gig Scraper UI")
 # Simple in-memory store for job status.
 JOBS: dict[str, dict[str, object]] = {}
 
+
+@contextmanager
+def _job_slot() -> None:
+    JOB_SEMAPHORE.acquire()
+    try:
+        yield
+    finally:
+        JOB_SEMAPHORE.release()
+
 @app.on_event("startup")
 async def _on_startup() -> None:
     global _cleanup_task
@@ -159,13 +169,45 @@ async def _on_startup() -> None:
     except Exception:
         pass
 
-UI_USER_AGENT = "JobScraper/0.1 (+https://github.com/novaheic)"
-UI_CONCURRENCY = 18
-UI_MAX_JOB_LINKS = 6
-UI_CRAWL_DEPTH = 3
-UI_LIMIT: Optional[int] = None
-UI_OVERPASS_URL: Optional[str] = None
-UI_LOG_LEVEL = "INFO"
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _parse_overpass_urls() -> list[str]:
+    urls: list[str] = []
+    when_multi = os.getenv("OVERPASS_URLS")
+    if when_multi:
+        urls.extend([u.strip() for u in when_multi.split(",") if u.strip()])
+    single = os.getenv("OVERPASS_URL")
+    if single:
+        urls.append(single.strip())
+    # Preserve insertion order but dedupe
+    seen: set[str] = set()
+    unique: list[str] = []
+    for url in urls:
+        if url and url not in seen:
+            seen.add(url)
+            unique.append(url)
+    return unique
+
+
+UI_USER_AGENT = os.getenv("UI_USER_AGENT", "JobScraper/0.1 (+https://github.com/novaheic)")
+UI_CONCURRENCY = _env_int("UI_CONCURRENCY", 18)
+UI_MAX_JOB_LINKS = _env_int("UI_MAX_JOB_LINKS", 6)
+UI_CRAWL_DEPTH = _env_int("UI_CRAWL_DEPTH", 3)
+_ui_limit = _env_int("UI_LIMIT", 0)
+UI_LIMIT: Optional[int] = _ui_limit if _ui_limit > 0 else None
+UI_OVERPASS_URLS = _parse_overpass_urls()
+UI_OVERPASS_URL: Optional[str] = UI_OVERPASS_URLS[0] if UI_OVERPASS_URLS else None
+UI_LOG_LEVEL = os.getenv("UI_LOG_LEVEL", "INFO")
+MAX_ACTIVE_JOBS = max(1, _env_int("UI_MAX_ACTIVE_JOBS", 3))
+JOB_SEMAPHORE = threading.Semaphore(MAX_ACTIVE_JOBS)
 
 EU_CITIES: list[str] = [
     # Austria
@@ -334,9 +376,14 @@ async def _execute_job(
     crawl_depth: int,
     log_level: str,
     overpass_url: str | None,
+    limit: int | None,
+    overpass_urls: Sequence[str] | None,
 ) -> None:
     # Phase 1: list places
-    JOBS[job_id].update(
+    job_record = JOBS.get(job_id)
+    if not job_record or job_record.get("status") == "cancelled":
+        return
+    job_record.update(
         {
             "status": "running",
             "phase": "listing",
@@ -346,6 +393,10 @@ async def _execute_job(
         }
     )
     kwargs: dict[str, object] = {}
+    if overpass_urls:
+        kwargs["overpass_urls"] = list(overpass_urls)
+        if not overpass_url and overpass_urls:
+            overpass_url = overpass_urls[0]
     if overpass_url:
         kwargs["overpass_url"] = overpass_url
 
@@ -355,13 +406,16 @@ async def _execute_job(
         except OverpassError:
             places = fetch_places_by_grid(area, amenities.split(","), **kwargs)
     except Exception as exc:  # pragma: no cover
-        JOBS[job_id]["status"] = "error"
-        JOBS[job_id]["error"] = f"Discovery failed: {exc}"
+        job_record["status"] = "error"
+        job_record["error"] = f"Discovery failed: {exc}"
         return
 
+    if limit is not None and limit >= 0:
+        places = places[:limit]
+
     total = len(places)
-    JOBS[job_id]["total"] = total
-    JOBS[job_id]["phase"] = "scanning"
+    job_record["total"] = total
+    job_record["phase"] = "scanning"
 
     # Phase 2: scan with progress
     results = []
@@ -381,7 +435,7 @@ async def _execute_job(
 
             for coro in asyncio.as_completed(tasks):
                 # Support cancellation signal
-                if JOBS.get(job_id, {}).get("status") == "cancelled":
+                if job_record.get("status") == "cancelled":
                     for t in tasks:
                         t.cancel()
                     break
@@ -390,30 +444,44 @@ async def _execute_job(
                 except Exception:
                     # Count as processed even if one task fails
                     res = None
-                JOBS[job_id]["processed"] = int(JOBS[job_id].get("processed", 0)) + 1
+                job_record["processed"] = int(job_record.get("processed", 0) or 0) + 1
                 if res is not None and getattr(res, "hiring", False):
-                    JOBS[job_id]["found"] = int(JOBS[job_id].get("found", 0)) + 1
+                    job_record["found"] = int(job_record.get("found", 0) or 0) + 1
                     results.append(res)
     except Exception as exc:  # pragma: no cover
-        JOBS[job_id]["status"] = "error"
-        JOBS[job_id]["error"] = f"Scan failed: {exc}"
+        job_record["status"] = "error"
+        job_record["error"] = f"Scan failed: {exc}"
         return
 
     # Phase 3: write CSV and finish
     deduped = _main_dedupe(results)
-    out_path = Path(JOBS[job_id]["output"])
+    output_ref = job_record.get("output")
+    if not output_ref:
+        job_record["status"] = "error"
+        job_record["error"] = "Missing output path"
+        return
+    out_path = Path(str(output_ref))
     try:
         _main_write_results(out_path, deduped)
     except Exception as exc:  # pragma: no cover
-        JOBS[job_id]["status"] = "error"
-        JOBS[job_id]["error"] = f"Write failed: {exc}"
+        job_record["status"] = "error"
+        job_record["error"] = f"Write failed: {exc}"
         return
 
-    JOBS[job_id]["status"] = "done"
+    job_record["status"] = "done"
+    job_record["phase"] = "complete"
+    job_record["finished_at"] = time.time()
 
 
 def _run_job_sync(*, job_id: str, **kwargs) -> None:
-    asyncio.run(_execute_job(job_id=job_id, **kwargs))
+    with _job_slot():
+        job = JOBS.get(job_id)
+        if not job or job.get("status") == "cancelled":
+            return
+        job["status"] = "running"
+        job["started_at"] = time.time()
+        _increment_jobs_started(1)
+        asyncio.run(_execute_job(job_id=job_id, **kwargs))
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -892,6 +960,14 @@ def index() -> str:
             setRunState("idle");
             return;
           }}
+          if (data.status === "queued") {{
+            if (typeof data.queue_position === "number" && typeof data.queue_length === "number") {{
+              runStatus.textContent = `Queued… waiting for an available slot (${data.queue_position}/${data.queue_length}).`;
+            }} else {{
+              runStatus.textContent = "Queued… waiting for an available slot.";
+            }}
+            return;
+          }}
           if (data.status === "running" && data.phase === "listing") {{
             runStatus.textContent = "Listing places…";
           }} else if (data.status === "running" && data.phase === "scanning") {{
@@ -1051,12 +1127,11 @@ def run(
     output_path = OUTPUT_DIR / f"{job_id}.csv"
 
     JOBS[job_id] = {
-        "status": "running",
+        "status": "queued",
         "output": str(output_path),
         "created_at": time.time(),
+        "queued_at": time.time(),
     }
-    # Count this as a started job (no DB; file-backed counter)
-    _increment_jobs_started(1)
 
     background.add_task(
         _run_job_sync,
@@ -1069,12 +1144,19 @@ def run(
         crawl_depth=UI_CRAWL_DEPTH,
         log_level=UI_LOG_LEVEL,
         overpass_url=UI_OVERPASS_URL,
+        limit=UI_LIMIT,
+        overpass_urls=UI_OVERPASS_URLS,
     )
     return {"job_id": job_id}
 
 @app.get("/stats")
 def stats():
     return {"jobs_started": _get_jobs_started()}
+
+
+@app.head("/stats")
+def stats_head():
+    return stats()
 
 
 @app.get("/status/{job_id}", response_class=HTMLResponse)
@@ -1114,7 +1196,22 @@ def status_json(job_id: str):
         "total": info.get("total"),
         "processed": info.get("processed"),
         "found": info.get("found"),
+        "max_active_jobs": MAX_ACTIVE_JOBS,
     }
+    if info.get("status") == "queued":
+        queued_jobs = sorted(
+            (
+                (jid, data)
+                for jid, data in JOBS.items()
+                if data.get("status") == "queued"
+            ),
+            key=lambda item: float(item[1].get("queued_at") or item[1].get("created_at") or 0.0),
+        )
+        for idx, (queued_id, _) in enumerate(queued_jobs, 1):
+            if queued_id == job_id:
+                payload["queue_position"] = idx
+                break
+        payload["queue_length"] = len(queued_jobs)
     if info.get("status") == "done":
         path = Path(info.get("output", ""))
         payload["download_url"] = f"/download/{job_id}" if path.exists() else None

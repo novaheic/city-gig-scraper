@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import csv
 import logging
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -121,9 +122,27 @@ def main(argv: Sequence[str] | None = None) -> None:
         "Fetching places for area='%s' with amenities=%s", args.area, ",".join(amenities)
     )
 
-    kwargs = {}
-    if args.overpass_url is not None:
-        kwargs["overpass_url"] = args.overpass_url
+    kwargs: dict[str, object] = {}
+    overpass_urls: list[str] = []
+    env_multi = os.getenv("OVERPASS_URLS")
+    if env_multi:
+        overpass_urls.extend([url.strip() for url in env_multi.split(",") if url.strip()])
+    env_single = os.getenv("OVERPASS_URL")
+    if env_single:
+        overpass_urls.append(env_single.strip())
+    if args.overpass_url:
+        overpass_urls.append(args.overpass_url.strip())
+
+    seen_urls: set[str] = set()
+    unique_urls: list[str] = []
+    for url in overpass_urls:
+        if url and url not in seen_urls:
+            seen_urls.add(url)
+            unique_urls.append(url)
+
+    if unique_urls:
+        kwargs["overpass_urls"] = unique_urls
+        kwargs["overpass_url"] = unique_urls[0]
 
     # Adaptive strategy:
     # 1) If user explicitly asked for districts, use them.

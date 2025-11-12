@@ -74,6 +74,36 @@ python -m job_scraper.main `
 - Download via a button (served from a temporary file)
 - Usage counter endpoint (`/stats`) writes to `output/stats.json` (override with `STATS_FILE`)
 - Temporary CSVs live under your system temp in a `city_gig_scraper_outputs` folder and are auto‑cleaned after ~1 hour
+- Jobs queue automatically when all worker slots are busy. The status indicator shows `Queued… (position/length)` until a slot frees up.
+- `/stats` now supports `HEAD` requests so free uptime monitors can keep the app warm without counting as traffic.
+
+### Hosting & tuning
+
+Environment variables (usable via `.env`, Render/Railway dashboards, etc.):
+
+- `OVERPASS_URLS`: Comma-separated list of Overpass endpoints. Requests fail over in order. Example: `https://overpass.kumi.systems/api/interpreter,https://overpass.openstreetmap.ru/api/interpreter`
+- `OVERPASS_URL`: Fallback single endpoint (appended to `OVERPASS_URLS`).
+- `UI_CONCURRENCY`: Async crawler concurrency (default 18).
+- `UI_MAX_JOB_LINKS`: Max job links per venue (default 6).
+- `UI_CRAWL_DEPTH`: Internal link depth for job pages (default 3).
+- `UI_LIMIT`: Optional soft cap on venues processed per run.
+- `UI_MAX_ACTIVE_JOBS`: Max concurrent jobs (default 3). Additional runs queue.
+- `UI_USER_AGENT`: Override the polite default header.
+- `UI_LOG_LEVEL`: Logging verbosity (`INFO`/`DEBUG`).
+
+Example `.env` for a hosted instance:
+
+```dotenv
+OVERPASS_URLS=https://overpass.kumi.systems/api/interpreter,https://overpass.openstreetmap.ru/api/interpreter
+UI_CONCURRENCY=10
+UI_MAX_JOB_LINKS=4
+UI_CRAWL_DEPTH=2
+UI_MAX_ACTIVE_JOBS=3
+UPSTASH_REDIS_REST_URL=...           # optional, for persistent counters/cache
+UPSTASH_REDIS_REST_TOKEN=...
+```
+
+Tip: Pair the app with a lightweight uptime ping (e.g., UptimeRobot `HEAD https://your-app/stats` every 10 minutes) to avoid cold starts on free tiers.
 
 ## CLI usage and flags
 
@@ -129,6 +159,10 @@ Tips for areas:
 - Use exact OSM names. Prefer “Frankfurt am Main” over “Frankfurt”.
 - If resolution fails, the tool may fall back to a Berlin‑Mitte bounding box. Double‑check spelling/casing.
 - For quick trials, combine a smaller area with `--limit` (e.g., `--limit 20`).
+- Overpass endpoints can also be supplied via environment variables in the CLI:
+  - `OVERPASS_URLS=https://overpass.kumi.systems/api/interpreter,https://overpass.openstreetmap.ru/api/interpreter`
+  - `OVERPASS_URL=https://overpass-api.de/api/interpreter` (optional single fallback)
+  - CLI honors the same failover logic used by the Web UI.
 
 ## Output
 
@@ -151,6 +185,8 @@ Google Sheets import:
 - Keep concurrency reasonable; be respectful of target sites.
 - Include a real user agent with contact info when using the CLI.
 - Overpass can rate‑limit or time out on large queries; use district splitting for big cities.
+- Provide multiple Overpass mirrors via `OVERPASS_URLS` so the scraper can fail over automatically.
+- Increase `UI_MAX_ACTIVE_JOBS` only if your host has spare CPU/network; otherwise the built-in queue keeps things fair for concurrent users.
 
 ## Development
 
