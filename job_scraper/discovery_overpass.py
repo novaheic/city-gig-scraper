@@ -24,6 +24,18 @@ REDIS_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
 AREA_CACHE: dict[str, int] = {}
 BBOX_CACHE: dict[str, tuple[float, float, float, float]] = {}
 
+MAX_AREA_CACHE_ENTRIES = 200
+MAX_BBOX_CACHE_ENTRIES = 200
+
+
+def _prune_cache(cache: dict, max_entries: int) -> None:
+    while len(cache) > max_entries:
+        try:
+            oldest_key = next(iter(cache))
+        except StopIteration:
+            break
+        cache.pop(oldest_key, None)
+
 
 class OverpassError(RuntimeError):
     """Raised when the Overpass API returns an unexpected response."""
@@ -121,9 +133,11 @@ def _set_cached_relation_id(area_name: str, relation_id: int | None) -> None:
     if relation_id and relation_id > 0:
         AREA_CACHE[key] = relation_id
         _redis_set(f"overpass:area:{key}", str(relation_id), ttl_seconds=7 * 24 * 3600)
+        _prune_cache(AREA_CACHE, MAX_AREA_CACHE_ENTRIES)
     else:
         AREA_CACHE[key] = 0
         _redis_set(f"overpass:area:{key}", "0", ttl_seconds=24 * 3600)
+        _prune_cache(AREA_CACHE, MAX_AREA_CACHE_ENTRIES)
 
 
 def _get_cached_bbox(area_name: str) -> tuple[float, float, float, float] | None:
@@ -153,6 +167,7 @@ def _set_cached_bbox(area_name: str, bbox: tuple[float, float, float, float] | N
             json.dumps([bbox[0], bbox[1], bbox[2], bbox[3]]),
             ttl_seconds=7 * 24 * 3600,
         )
+        _prune_cache(BBOX_CACHE, MAX_BBOX_CACHE_ENTRIES)
     else:
         if key in BBOX_CACHE:
             BBOX_CACHE.pop(key, None)

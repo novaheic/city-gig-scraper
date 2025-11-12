@@ -199,6 +199,11 @@ class AsyncCrawler:
             error=None,
         )
 
+    def clear_host_state(self) -> None:
+        """Remove cached per-host throttling state to free memory."""
+        self._host_semaphores.clear()
+        self._host_last_request_ts.clear()
+
 
 def _sanitize_url(url: str) -> str:
     """Remove control characters and normalize basic whitespace in URLs.

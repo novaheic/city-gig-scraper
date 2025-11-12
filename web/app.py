@@ -154,6 +154,33 @@ app = FastAPI(title="City Gig Scraper UI")
 JOBS: dict[str, dict[str, object]] = {}
 
 
+def _load_preview_rows(path: Path, limit: int = 50) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    if not path.exists() or not path.is_file():
+        return rows
+    try:
+        with path.open("r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            for index, row in enumerate(reader):
+                if index >= limit:
+                    break
+                rows.append({k: str(v) for k, v in row.items()})
+    except Exception:
+        return []
+    return rows
+
+
+def _ensure_preview(job_record: dict[str, object], *, limit: int = 50) -> list[dict[str, str]]:
+    preview = job_record.get("preview")
+    if isinstance(preview, list):
+        return preview  # type: ignore[return-value]
+    output_ref = job_record.get("output") or ""
+    path = Path(str(output_ref))
+    rows = _load_preview_rows(path, limit=limit)
+    job_record["preview"] = rows
+    return rows
+
+
 @contextmanager
 def _job_slot() -> None:
     JOB_SEMAPHORE.acquire()
@@ -570,6 +597,10 @@ async def _execute_job(
         job_record["status"] = "error"
         job_record["error"] = f"Discovery failed: {exc}"
         return
+    except MemoryError as exc:  # pragma: no cover
+        job_record["status"] = "error"
+        job_record["error"] = "Scrape failed: out of memory."
+        return
 
     if limit is not None and limit >= 0:
         places = places[:limit]
@@ -592,80 +623,86 @@ async def _execute_job(
     if job_record.get("status") == "cancelled":
         return
 
+    crawler = AsyncCrawler(user_agent=user_agent, concurrency=concurrency)
     try:
-        async with AsyncCrawler(user_agent=user_agent, concurrency=concurrency) as crawler:
-            # Prepare streaming CSV writer
-            out_handle = out_path.open("w", newline="", encoding="utf-8")
-            writer = csv.DictWriter(out_handle, fieldnames=fieldnames)
-            writer.writeheader()
-            out_handle.flush()
+        async with crawler as active_crawler:
+            with out_path.open("w", newline="", encoding="utf-8") as out_handle:
+                writer = csv.DictWriter(out_handle, fieldnames=fieldnames)
+                writer.writeheader()
+                out_handle.flush()
 
-            write_lock = asyncio.Lock()
-            seen_job_pages: set[str] = set()
+                write_lock = asyncio.Lock()
+                seen_job_pages: set[str] = set()
 
-            queue: asyncio.Queue[object] = asyncio.Queue(maxsize=max(1, concurrency * 5))
-            num_workers = max(1, concurrency)
+                queue: asyncio.Queue[object] = asyncio.Queue(maxsize=max(1, concurrency * 5))
+                num_workers = max(1, concurrency)
 
-            async def worker() -> None:
-                while True:
-                    item = await queue.get()
-                    try:
-                        if item is None:
-                            return
-                        if job_record.get("status") == "cancelled":
-                            continue
-                        place = item  # type: ignore[assignment]
+                async def worker() -> None:
+                    while True:
+                        item = await queue.get()
                         try:
-                            res = await _main_process_place(
-                                place,
-                                crawler,
-                                max_job_links=max_job_links,
-                                crawl_depth=crawl_depth,
-                            )
-                        except Exception:
-                            res = None
-                        # Count as processed even if one task fails
-                        job_record["processed"] = int(job_record.get("processed", 0) or 0) + 1
-                        if res is not None and getattr(res, "hiring", False) and getattr(res, "job_page_url", None):
-                            canonical = _main_canonicalize_url(res.job_page_url) or res.job_page_url
-                            async with write_lock:
-                                if canonical not in seen_job_pages:
-                                    seen_job_pages.add(canonical)
-                                    writer.writerow(
-                                        {
-                                            "name": res.place.name,
-                                            "type": res.place.amenity,
-                                            "homepage": res.place.website,
-                                            "job_page_url": res.job_page_url or "",
-                                        }
-                                    )
-                                    out_handle.flush()
-                                    job_record["found"] = int(job_record.get("found", 0) or 0) + 1
-                    finally:
-                        queue.task_done()
+                            if item is None:
+                                return
+                            if job_record.get("status") == "cancelled":
+                                continue
+                            place = item  # type: ignore[assignment]
+                            try:
+                                res = await _main_process_place(
+                                    place,
+                                    active_crawler,
+                                    max_job_links=max_job_links,
+                                    crawl_depth=crawl_depth,
+                                )
+                            except Exception:
+                                res = None
+                            job_record["processed"] = int(job_record.get("processed", 0) or 0) + 1
+                            if res is not None and getattr(res, "hiring", False) and getattr(res, "job_page_url", None):
+                                canonical = _main_canonicalize_url(res.job_page_url) or res.job_page_url
+                                async with write_lock:
+                                    if canonical not in seen_job_pages:
+                                        seen_job_pages.add(canonical)
+                                        writer.writerow(
+                                            {
+                                                "name": res.place.name,
+                                                "type": res.place.amenity,
+                                                "homepage": res.place.website,
+                                                "job_page_url": res.job_page_url or "",
+                                            }
+                                        )
+                                        out_handle.flush()
+                                        job_record["found"] = int(job_record.get("found", 0) or 0) + 1
+                        finally:
+                            queue.task_done()
 
-            workers = [asyncio.create_task(worker()) for _ in range(num_workers)]
-            try:
-                for place in places:
-                    if job_record.get("status") == "cancelled":
-                        break
-                    await queue.put(place)
-            finally:
-                # Signal shutdown to workers
-                for _ in range(num_workers):
-                    await queue.put(None)
-                await queue.join()
-                for w in workers:
-                    await w
-            out_handle.close()
+                workers = [asyncio.create_task(worker()) for _ in range(num_workers)]
+                try:
+                    for place in places:
+                        if job_record.get("status") == "cancelled":
+                            break
+                        await queue.put(place)
+                finally:
+                    for _ in range(num_workers):
+                        await queue.put(None)
+                    await queue.join()
+                    for w in workers:
+                        await w
+    except MemoryError:  # pragma: no cover
+        job_record["status"] = "error"
+        job_record["error"] = "Scrape failed: out of memory. Please narrow the search."
+        return
     except Exception as exc:  # pragma: no cover
         job_record["status"] = "error"
         job_record["error"] = f"Scan failed: {exc}"
         return
+    finally:
+        crawler.clear_host_state()
 
     # If cancelled during scanning, stop (best-effort: output may have partial rows)
     if job_record.get("status") == "cancelled":
+        _ensure_preview(job_record)
         return
+
+    _ensure_preview(job_record)
 
     job_record["status"] = "done"
     job_record["phase"] = "complete"
@@ -708,7 +745,14 @@ def _run_job_sync(*, job_id: str, **kwargs) -> None:
         job["status"] = "running"
         job["started_at"] = time.time()
         _increment_jobs_started(1)
-        asyncio.run(_execute_job(job_id=job_id, **kwargs))
+        try:
+            asyncio.run(_execute_job(job_id=job_id, **kwargs))
+        except MemoryError:  # pragma: no cover
+            job = JOBS.get(job_id)
+            if job:
+                job["status"] = "error"
+                job["error"] = "Scrape failed: out of memory. Please narrow the search."
+            return
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -1786,6 +1830,7 @@ def status_json(job_id: str):
         "notify_set": bool(info.get("notify_email")),
         "email_sent": bool(info.get("email_sent_at")),
         "email_failed": bool(info.get("email_error")),
+        "error": info.get("error"),
     }
     if info.get("status") == "queued":
         queued_jobs = sorted(
@@ -1802,38 +1847,14 @@ def status_json(job_id: str):
                 break
         payload["queue_length"] = len(queued_jobs)
     if info.get("status") == "done":
-        path = Path(info.get("output", ""))
+        path = Path(str(info.get("output", "")))
         payload["download_url"] = f"/download/{job_id}" if path.exists() else None
-        # Provide a small preview (first 50 rows)
-        preview_rows = []
-        try:
-            if path.exists():
-                with path.open("r", encoding="utf-8", newline="") as f:
-                    reader = csv.DictReader(f)
-                    for i, row in enumerate(reader):
-                        if i >= 50:
-                            break
-                        preview_rows.append(row)
-        except Exception:
-            preview_rows = []
-        payload["preview"] = preview_rows
+        payload["preview"] = _ensure_preview(info)
     elif info.get("status") == "cancelled":
-        # For cancelled jobs, provide download_url if output file exists
-        path = Path(info.get("output", ""))
+        path = Path(str(info.get("output", "")))
         if path.exists():
             payload["download_url"] = f"/download/{job_id}"
-            # Provide a small preview (first 50 rows) for cancelled jobs with results
-            preview_rows = []
-            try:
-                with path.open("r", encoding="utf-8", newline="") as f:
-                    reader = csv.DictReader(f)
-                    for i, row in enumerate(reader):
-                        if i >= 50:
-                            break
-                        preview_rows.append(row)
-            except Exception:
-                preview_rows = []
-            payload["preview"] = preview_rows
+        payload["preview"] = _ensure_preview(info)
     return payload
 
 
@@ -1870,6 +1891,8 @@ def cancel(job_id: str):
             pass
         # Remove job metadata only if no results
         JOBS.pop(job_id, None)
+    else:
+        _ensure_preview(info)
     # If has_results is True, keep the job in JOBS so status endpoint can find it
     return {"ok": True}
 
