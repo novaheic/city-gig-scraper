@@ -33,6 +33,8 @@ The hosted version is a bit slower since it's shared. Drop in your email address
 
 **Privacy**: Nothing is saved. No database, no tracking. CSV files are deleted after 1 hour (or 24 hours if you use email). We only keep your email in memory until the job finishes.
 
+**Speed**: Hosting is slower than running it yourself. We have limits as to how much we can scrape at one moment. There is a queue, but if you're in a rush or want to scrape several large cities, run it locally.
+
 ---
 
 ## 💻 Run it yourself (faster, full control)

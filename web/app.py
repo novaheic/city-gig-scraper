@@ -38,6 +38,7 @@ from job_scraper.discovery_overpass import (
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logging.getLogger("httpx").setLevel(logging.INFO)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
+logger = logging.getLogger(__name__)
 
 # Ephemeral output storage (temp directory) with automatic cleanup
 OUTPUT_DIR = Path(tempfile.gettempdir()) / "city_gig_scraper_outputs"
