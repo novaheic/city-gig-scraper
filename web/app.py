@@ -26,6 +26,7 @@ from job_scraper.main import DEFAULT_AREA, main as cli_main
 from job_scraper.main import _process_place as _main_process_place  # type: ignore
 from job_scraper.main import _write_results as _main_write_results  # type: ignore
 from job_scraper.main import _deduplicate_by_job_page as _main_dedupe  # type: ignore
+from job_scraper.main import _canonicalize_url as _main_canonicalize_url  # type: ignore
 from job_scraper.crawler import AsyncCrawler
 from job_scraper.discovery_overpass import (
     OverpassError,
@@ -336,7 +337,7 @@ def send_result_email(to_email: str, subject: str, text_body: str, html_body: st
 
 
 UI_USER_AGENT = os.getenv("UI_USER_AGENT", "JobScraper/0.1 (+https://github.com/novaheic)")
-UI_CONCURRENCY = _env_int("UI_CONCURRENCY", 18)
+UI_CONCURRENCY = _env_int("UI_CONCURRENCY", 8)
 UI_MAX_JOB_LINKS = _env_int("UI_MAX_JOB_LINKS", 6)
 UI_CRAWL_DEPTH = _env_int("UI_CRAWL_DEPTH", 3)
 _ui_limit = _env_int("UI_LIMIT", 0)
@@ -557,6 +558,9 @@ async def _execute_job(
     if overpass_url:
         kwargs["overpass_url"] = overpass_url
 
+    # Early cancellation check before doing network-bound discovery
+    if job_record.get("status") == "cancelled":
+        return
     try:
         try:
             places = fetch_places(area, amenities.split(","), **kwargs)
@@ -574,55 +578,93 @@ async def _execute_job(
     job_record["total"] = total
     job_record["phase"] = "scanning"
 
-    # Phase 2: scan with progress
-    results = []
-    try:
-        async with AsyncCrawler(user_agent=user_agent, concurrency=concurrency) as crawler:
-            tasks = [
-                asyncio.create_task(
-                    _main_process_place(
-                        place,
-                        crawler,
-                        max_job_links=max_job_links,
-                        crawl_depth=crawl_depth,
-                    )
-                )
-                for place in places
-            ]
-
-            for coro in asyncio.as_completed(tasks):
-                # Support cancellation signal
-                if job_record.get("status") == "cancelled":
-                    for t in tasks:
-                        t.cancel()
-                    break
-                try:
-                    res = await coro
-                except Exception:
-                    # Count as processed even if one task fails
-                    res = None
-                job_record["processed"] = int(job_record.get("processed", 0) or 0) + 1
-                if res is not None and getattr(res, "hiring", False):
-                    job_record["found"] = int(job_record.get("found", 0) or 0) + 1
-                    results.append(res)
-    except Exception as exc:  # pragma: no cover
-        job_record["status"] = "error"
-        job_record["error"] = f"Scan failed: {exc}"
-        return
-
-    # Phase 3: write CSV and finish
-    deduped = _main_dedupe(results)
+    # Phase 2: scan with progress (streaming write, bounded workers)
     output_ref = job_record.get("output")
     if not output_ref:
         job_record["status"] = "error"
         job_record["error"] = "Missing output path"
         return
     out_path = Path(str(output_ref))
+    fieldnames = ["name", "type", "homepage", "job_page_url"]
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # If cancelled after discovery, exit before spinning up crawl tasks
+    if job_record.get("status") == "cancelled":
+        return
+
     try:
-        _main_write_results(out_path, deduped)
+        async with AsyncCrawler(user_agent=user_agent, concurrency=concurrency) as crawler:
+            # Prepare streaming CSV writer
+            out_handle = out_path.open("w", newline="", encoding="utf-8")
+            writer = csv.DictWriter(out_handle, fieldnames=fieldnames)
+            writer.writeheader()
+            out_handle.flush()
+
+            write_lock = asyncio.Lock()
+            seen_job_pages: set[str] = set()
+
+            queue: asyncio.Queue[object] = asyncio.Queue(maxsize=max(1, concurrency * 5))
+            num_workers = max(1, concurrency)
+
+            async def worker() -> None:
+                while True:
+                    item = await queue.get()
+                    try:
+                        if item is None:
+                            return
+                        if job_record.get("status") == "cancelled":
+                            continue
+                        place = item  # type: ignore[assignment]
+                        try:
+                            res = await _main_process_place(
+                                place,
+                                crawler,
+                                max_job_links=max_job_links,
+                                crawl_depth=crawl_depth,
+                            )
+                        except Exception:
+                            res = None
+                        # Count as processed even if one task fails
+                        job_record["processed"] = int(job_record.get("processed", 0) or 0) + 1
+                        if res is not None and getattr(res, "hiring", False) and getattr(res, "job_page_url", None):
+                            canonical = _main_canonicalize_url(res.job_page_url) or res.job_page_url
+                            async with write_lock:
+                                if canonical not in seen_job_pages:
+                                    seen_job_pages.add(canonical)
+                                    writer.writerow(
+                                        {
+                                            "name": res.place.name,
+                                            "type": res.place.amenity,
+                                            "homepage": res.place.website,
+                                            "job_page_url": res.job_page_url or "",
+                                        }
+                                    )
+                                    out_handle.flush()
+                                    job_record["found"] = int(job_record.get("found", 0) or 0) + 1
+                    finally:
+                        queue.task_done()
+
+            workers = [asyncio.create_task(worker()) for _ in range(num_workers)]
+            try:
+                for place in places:
+                    if job_record.get("status") == "cancelled":
+                        break
+                    await queue.put(place)
+            finally:
+                # Signal shutdown to workers
+                for _ in range(num_workers):
+                    await queue.put(None)
+                await queue.join()
+                for w in workers:
+                    await w
+            out_handle.close()
     except Exception as exc:  # pragma: no cover
         job_record["status"] = "error"
-        job_record["error"] = f"Write failed: {exc}"
+        job_record["error"] = f"Scan failed: {exc}"
+        return
+
+    # If cancelled during scanning, stop (best-effort: output may have partial rows)
+    if job_record.get("status") == "cancelled":
         return
 
     job_record["status"] = "done"
@@ -704,11 +746,15 @@ def index() -> str:
       }}
       input[type="text"],
       input[type="number"],
+      input[type="email"],
       select {{
         width: 100%;
         padding: 0.55rem;
         border-radius: 6px;
         border: 1px solid #d0d7de;
+      }}
+      #notify-email-input {{
+        max-width: 250px;
       }}
       .row {{
         display: flex;
@@ -898,17 +944,16 @@ def index() -> str:
         <span id="run-status" class="hint" style="margin-left: 0.75rem;"></span>
       </div>
       <div id="notify-email-wrapper" style="margin-top:1.1rem; display:none;">
-        <label id="notify-email-field" style="display:block;font-weight:500;">
-          This might take a while—drop your email and we’ll send you the CSV when we’re done.
+        <label id="notify-email-field" style="display:block;font-weight:400;color:#667085;font-size:0.95rem;">
+          This might take a while—drop your email and we'll send you the CSV when we're done.
           <div style="display:flex;gap:0.6rem;align-items:center;margin-top:0.4rem;">
             <input
               type="email"
               name="notify_email"
               id="notify-email-input"
               placeholder="you@example.com"
-              style="flex:1;"
             />
-            <button type="button" id="notify-email-confirm" style="margin:0;padding:0.55rem 1rem;">Confirm</button>
+            <button type="button" id="notify-email-confirm" style="margin:0;padding:0.55rem 0.95rem;" aria-label="Confirm email">✔</button>
           </div>
         </label>
         <div id="notify-email-error" class="error-text" style="display:none;"></div>
@@ -1046,6 +1091,7 @@ def index() -> str:
       let currentJobId = null;
       let pollTimer = null;
       let notifyConfigured = false;
+      let confirmedEmailValue = "";
 
       async function refreshJobsStarted() {{
         try {{
@@ -1191,7 +1237,7 @@ def index() -> str:
             const total = data.total ?? 0;
             const processed = data.processed ?? 0;
             const found = data.found ?? 0;
-            runStatus.textContent = `Scanned ${{processed}}/${{total}} places, found ${{found}} hiring pages - most results appear in the last 1/3 of the scan.`;
+            runStatus.textContent = `Scanned ${{processed}}/${{total}} places, found ${{found}} hiring pages.`;
           }} else if (data.status === "done") {{
             runStatus.textContent = "Done.";
             setRunState("idle");
@@ -1203,12 +1249,38 @@ def index() -> str:
               downloadLink.href = data.download_url;
               downloadLink.style.display = "inline-block";
             }}
+            if (data.email_sent) {{
+              const msg = confirmedEmailValue
+                ? "Successfully sent to " + confirmedEmailValue
+                : "Download link sent successfully.";
+              showEmailMessage(msg, false);
+            }} else if (data.email_failed) {{
+              const msg = confirmedEmailValue
+                ? "Failed to send email to " + confirmedEmailValue
+                : "Failed to send email notification.";
+              showEmailMessage(msg, true);
+            }} else if (data.notify_set) {{
+              const msg = confirmedEmailValue
+                ? "Notification set. We'll email " + confirmedEmailValue + " when results are ready."
+                : "Notification set.";
+              showEmailMessage(msg, false);
+            }} else {{
+              hideEmailUI();
+            }}
             return;
           }} else if (data.status === "cancelled") {{
             runStatus.textContent = "Cancelled.";
             setRunState("idle");
             clearInterval(pollTimer);
             pollTimer = null;
+            // Show results if available (partial results from cancelled scan)
+            if (data.download_url) {{
+              previewContainer.hidden = false;
+              renderPreview(data.preview || []);
+              downloadLink.href = data.download_url;
+              downloadLink.style.display = "inline-block";
+            }}
+            hideEmailUI();
             return;
           }} else if (data.status === "error") {{
             runStatus.textContent = "Error: " + (data.error || "");
@@ -1233,6 +1305,16 @@ def index() -> str:
         notifyEmailInput.addEventListener("input", () => {{
           if (notifyEmailField) {{
             clearFieldError(notifyEmailField, notifyEmailError);
+          }}
+        }});
+        // Pressing Enter in the email field should confirm email, not submit/cancel the form
+        notifyEmailInput.addEventListener("keydown", (e) => {{
+          if (e.key === "Enter") {{
+            e.preventDefault();
+            e.stopPropagation();
+            if (notifyEmailConfirm) {{
+              notifyEmailConfirm.click();
+            }}
           }}
         }});
       }}
@@ -1276,11 +1358,8 @@ def index() -> str:
         }}
         if (notifyEmailInput) {{
           const emailVal = notifyEmailInput.value.trim();
-          if (emailVal && !/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(emailVal)) {{
+          if (emailVal && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailVal)) {{
             showFieldError(notifyEmailField, notifyEmailError, "Please enter a valid email address.");
-            if (valid) {{
-              notifyEmailInput.focus();
-            }}
             valid = false;
           }} else {{
             clearFieldError(notifyEmailField, notifyEmailError);
@@ -1297,34 +1376,14 @@ def index() -> str:
           }} finally {{
             // status poller will pick up 'cancelled'
           }}
+          hideEmailUI();
           return;
         }}
         // start new job
         previewContainer.hidden = true;
         downloadLink.style.display = "none";
         runStatus.textContent = "";
-        if (notifyWrapper) {{
-          notifyWrapper.style.display = "none";
-        }}
-        if (notifyEmailField) {{
-          clearFieldError(notifyEmailField, notifyEmailError);
-        }}
-        if (notifyEmailConfirmed) {{
-          notifyEmailConfirmed.style.display = "none";
-          notifyEmailConfirmed.textContent = "";
-        }}
-        if (notifyEmailActions) {{
-          notifyEmailActions.style.display = "none";
-        }}
-        if (notifyEmailInput) {{
-          notifyEmailInput.value = "";
-          notifyEmailInput.style.display = "";
-        }}
-        if (notifyEmailConfirm) {{
-          notifyEmailConfirm.style.display = "";
-          notifyEmailConfirm.disabled = false;
-          notifyEmailConfirm.textContent = "Confirm";
-        }}
+        hideEmailUI();
         notifyConfigured = false;
         try {{
           const formData = new FormData(formEl);
@@ -1343,12 +1402,9 @@ def index() -> str:
           const data = await res.json();
           currentJobId = data.job_id;
           setRunState("running");
-          runStatus.textContent = "Listing places…";
+          runStatus.textContent = "Queued… waiting for an available slot.";
           if (notifyWrapper) {{
-            notifyWrapper.style.display = "block";
-          }}
-          if (notifyEmailInput) {{
-            notifyEmailInput.focus();
+            showEmailInputState();
           }}
           // Refresh footer counter after a successful start
           refreshJobsStarted();
@@ -1360,6 +1416,81 @@ def index() -> str:
         }}
       }});
 
+      function hideEmailUI() {{
+        if (notifyWrapper) notifyWrapper.style.display = "none";
+        if (notifyEmailField) notifyEmailField.classList.remove("has-error");
+        if (notifyEmailError) {{
+          notifyEmailError.textContent = "";
+          notifyEmailError.style.display = "none";
+        }}
+        if (notifyEmailInput) notifyEmailInput.style.display = "";
+        if (notifyEmailConfirm) {{
+          notifyEmailConfirm.style.display = "";
+          notifyEmailConfirm.disabled = false;
+          notifyEmailConfirm.textContent = "✔";
+        }}
+        if (notifyEmailConfirmed) {{
+          notifyEmailConfirmed.textContent = "";
+          notifyEmailConfirmed.style.display = "none";
+        }}
+        if (notifyEmailActions) notifyEmailActions.style.display = "none";
+      }}
+
+      function showEmailInputState() {{
+        if (!notifyWrapper) return;
+        notifyWrapper.style.display = "block";
+        if (notifyEmailField) notifyEmailField.classList.remove("has-error");
+        if (notifyEmailError) {{
+          notifyEmailError.textContent = "";
+          notifyEmailError.style.display = "none";
+        }}
+        if (confirmedEmailValue) {{
+          if (notifyEmailInput) notifyEmailInput.style.display = "none";
+          if (notifyEmailConfirm) {{
+            notifyEmailConfirm.style.display = "none";
+            notifyEmailConfirm.disabled = false;
+            notifyEmailConfirm.textContent = "✔";
+          }}
+          if (notifyEmailConfirmed) {{
+            notifyEmailConfirmed.textContent = "We'll send a download link to " + confirmedEmailValue;
+            notifyEmailConfirmed.style.display = "block";
+          }}
+          if (notifyEmailActions) notifyEmailActions.style.display = "block";
+        }} else {{
+          if (notifyEmailInput) {{
+            notifyEmailInput.style.display = "";
+            notifyEmailInput.value = "";
+          }}
+          if (notifyEmailConfirm) {{
+            notifyEmailConfirm.style.display = "";
+            notifyEmailConfirm.disabled = false;
+            notifyEmailConfirm.textContent = "✔";
+          }}
+          if (notifyEmailConfirmed) {{
+            notifyEmailConfirmed.textContent = "";
+            notifyEmailConfirmed.style.display = "none";
+          }}
+          if (notifyEmailActions) notifyEmailActions.style.display = "none";
+        }}
+      }}
+
+      function showEmailMessage(message, isError = false) {{
+        if (!notifyWrapper) return;
+        notifyWrapper.style.display = "block";
+        if (notifyEmailField) notifyEmailField.classList.toggle("has-error", isError);
+        if (notifyEmailError) {{
+          notifyEmailError.textContent = "";
+          notifyEmailError.style.display = "none";
+        }}
+        if (notifyEmailInput) notifyEmailInput.style.display = "none";
+        if (notifyEmailConfirm) notifyEmailConfirm.style.display = "none";
+        if (notifyEmailActions) notifyEmailActions.style.display = "none";
+        if (notifyEmailConfirmed) {{
+          notifyEmailConfirmed.textContent = message;
+          notifyEmailConfirmed.style.display = message ? "block" : "none";
+        }}
+      }}
+
       if (notifyEmailConfirm) {{
         notifyEmailConfirm.addEventListener("click", async () => {{
           if (!notifyEmailInput) {{
@@ -1368,12 +1499,10 @@ def index() -> str:
           const emailVal = notifyEmailInput.value.trim();
           if (!emailVal) {{
             showFieldError(notifyEmailField, notifyEmailError, "Please enter an email address.");
-            notifyEmailInput.focus();
             return;
           }}
           if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailVal)) {{
             showFieldError(notifyEmailField, notifyEmailError, "Please enter a valid email address.");
-            notifyEmailInput.focus();
             return;
           }}
           if (!currentJobId) {{
@@ -1396,24 +1525,17 @@ def index() -> str:
               const message = (data && data.error) || "Could not save email.";
               showFieldError(notifyEmailField, notifyEmailError, message);
               notifyEmailConfirm.disabled = false;
-              notifyEmailConfirm.textContent = "Confirm";
+              notifyEmailConfirm.textContent = "✔";
               return;
             }}
+            confirmedEmailValue = emailVal;
             notifyConfigured = true;
-            clearFieldError(notifyEmailField, notifyEmailError);
-            notifyEmailInput.style.display = "none";
-            notifyEmailConfirm.style.display = "none";
-            if (notifyEmailConfirmed) {{
-              notifyEmailConfirmed.textContent = `We'll send a download link to ${{emailVal}}`;
-              notifyEmailConfirmed.style.display = "block";
-            }}
-            if (notifyEmailActions) {{
-              notifyEmailActions.style.display = "block";
-            }}
+            showEmailInputState();
+            return;
           }} catch (err) {{
             showFieldError(notifyEmailField, notifyEmailError, "Could not save email.");
             notifyEmailConfirm.disabled = false;
-            notifyEmailConfirm.textContent = "Confirm";
+            notifyEmailConfirm.textContent = "✔";
           }}
         }});
       }}
@@ -1424,10 +1546,15 @@ def index() -> str:
             return;
           }}
           notifyConfigured = false;
-          notifyEmailInput.style.display = "";
-          notifyEmailConfirm.style.display = "";
-          notifyEmailConfirm.disabled = false;
-          notifyEmailConfirm.textContent = "Confirm";
+          if (notifyEmailInput) {{
+            notifyEmailInput.style.display = "";
+            notifyEmailInput.value = confirmedEmailValue;
+          }}
+          if (notifyEmailConfirm) {{
+            notifyEmailConfirm.style.display = "";
+            notifyEmailConfirm.disabled = false;
+            notifyEmailConfirm.textContent = "✔";
+          }}
           if (notifyEmailActions) {{
             notifyEmailActions.style.display = "none";
           }}
@@ -1435,7 +1562,6 @@ def index() -> str:
             notifyEmailConfirmed.textContent = "";
             notifyEmailConfirmed.style.display = "none";
           }}
-          notifyEmailInput.focus();
         }});
       }}
 
@@ -1457,23 +1583,9 @@ def index() -> str:
               notifyEmailDelete.disabled = false;
               return;
             }}
+            confirmedEmailValue = "";
             notifyConfigured = false;
-            if (notifyEmailInput) {{
-              notifyEmailInput.value = "";
-              notifyEmailInput.style.display = "";
-            }}
-            if (notifyEmailConfirm) {{
-              notifyEmailConfirm.style.display = "";
-              notifyEmailConfirm.disabled = false;
-              notifyEmailConfirm.textContent = "Confirm";
-            }}
-            if (notifyEmailActions) {{
-              notifyEmailActions.style.display = "none";
-            }}
-            if (notifyEmailConfirmed) {{
-              notifyEmailConfirmed.textContent = "";
-              notifyEmailConfirmed.style.display = "none";
-            }}
+            showEmailInputState();
             notifyEmailDelete.disabled = false;
           }} catch (err) {{
             showFieldError(notifyEmailField, notifyEmailError, "Could not remove email.");
@@ -1671,7 +1783,9 @@ def status_json(job_id: str):
         "total": info.get("total"),
         "processed": info.get("processed"),
         "found": info.get("found"),
-        "max_active_jobs": MAX_ACTIVE_JOBS,
+        "notify_set": bool(info.get("notify_email")),
+        "email_sent": bool(info.get("email_sent_at")),
+        "email_failed": bool(info.get("email_error")),
     }
     if info.get("status") == "queued":
         queued_jobs = sorted(
@@ -1703,6 +1817,23 @@ def status_json(job_id: str):
         except Exception:
             preview_rows = []
         payload["preview"] = preview_rows
+    elif info.get("status") == "cancelled":
+        # For cancelled jobs, provide download_url if output file exists
+        path = Path(info.get("output", ""))
+        if path.exists():
+            payload["download_url"] = f"/download/{job_id}"
+            # Provide a small preview (first 50 rows) for cancelled jobs with results
+            preview_rows = []
+            try:
+                with path.open("r", encoding="utf-8", newline="") as f:
+                    reader = csv.DictReader(f)
+                    for i, row in enumerate(reader):
+                        if i >= 50:
+                            break
+                        preview_rows.append(row)
+            except Exception:
+                preview_rows = []
+            payload["preview"] = preview_rows
     return payload
 
 
@@ -1712,21 +1843,40 @@ def cancel(job_id: str):
     if not info:
         return {"ok": False, "error": "unknown_job"}
     info["status"] = "cancelled"
-    # Best-effort delete any output immediately
+    # Check if output file exists and has content (at least one data row)
+    has_results = False
     try:
         path = Path(str(info.get("output", "")))
         if path.exists() and path.is_file():
-            path.unlink(missing_ok=True)
+            # Check if file has at least one data row (beyond header)
+            with path.open("r", encoding="utf-8", newline="") as f:
+                reader = csv.DictReader(f)
+                try:
+                    next(reader)  # Try to read first data row
+                    has_results = True
+                except StopIteration:
+                    # File only has header, no data rows
+                    has_results = False
     except Exception:
         pass
-    # Remove job metadata
-    JOBS.pop(job_id, None)
+    
+    # Only delete output if it has no results, and only remove job if no results
+    if not has_results:
+        try:
+            path = Path(str(info.get("output", "")))
+            if path.exists() and path.is_file():
+                path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        # Remove job metadata only if no results
+        JOBS.pop(job_id, None)
+    # If has_results is True, keep the job in JOBS so status endpoint can find it
     return {"ok": True}
 
 @app.get("/download/{job_id}")
 def download(job_id: str):
     info = JOBS.get(job_id)
-    if not info or info.get("status") != "done":
+    if not info or info.get("status") not in ("done", "cancelled"):
         return PlainTextResponse("Job not ready", status_code=404)
 
     output_path = Path(info.get("output", ""))
